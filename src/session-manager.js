@@ -61,10 +61,14 @@ function entryFor(clinicId) {
   return entry;
 }
 
-export function getSessionStatus(clinicId) {
-  const entry = entryFor(clinicId);
+function hasPersistedAuth(clinicId) {
+  const creds = path.join(authDirFor(clinicId), "creds.json");
+  return fs.existsSync(creds);
+}
+
+function statusPayload(entry) {
   return {
-    clinic_id: clinicId,
+    clinic_id: entry.clinicId,
     status: entry.status,
     qr: entry.qr,
     pairing_code: entry.pairingCode,
@@ -73,6 +77,32 @@ export function getSessionStatus(clinicId) {
     profile_name: entry.profileName,
     last_error: entry.lastError,
   };
+}
+
+/** Clinic-scoped status: restores from disk when auth exists but memory entry is cold. */
+export async function getSessionStatus(clinicId) {
+  const entry = entryFor(clinicId);
+  const persisted = hasPersistedAuth(clinicId);
+
+  if (
+    persisted &&
+    entry.status === "disconnected" &&
+    !entry.sock
+  ) {
+    entry.status = "reconnecting";
+    startSession(clinicId, "qr", null, true).catch((err) => {
+      entry.lastError = err?.message || "Restore failed";
+      entry.status = "disconnected";
+    });
+
+    return statusPayload(entry);
+  }
+
+  if (persisted && entry.status === "disconnected" && entry.sock) {
+    entry.status = "connected";
+  }
+
+  return statusPayload(entry);
 }
 
 export async function restoreAllSessions() {
@@ -168,7 +198,7 @@ export async function startSession(clinicId, method = "qr", phone = null, isRest
     }
   }
 
-  return getSessionStatus(clinicId);
+  return statusPayload(entry);
 }
 
 export async function reconnectSession(clinicId) {
@@ -198,12 +228,31 @@ export async function disconnectSession(clinicId) {
     fs.rmSync(entry.authDir, { recursive: true, force: true });
   }
 
-  return getSessionStatus(clinicId);
+  return statusPayload(entry);
 }
 
 function phoneToJid(phone) {
   const digits = String(phone).replace(/\D/g, "");
   return `${digits}@s.whatsapp.net`;
+}
+
+function mimeFromFileName(fileName, fallback = "application/octet-stream") {
+  const ext = path.extname(String(fileName || "")).toLowerCase();
+  const map = {
+    ".pdf": "application/pdf",
+    ".webm": "audio/webm",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+  };
+  return map[ext] || fallback;
 }
 
 /**
@@ -234,7 +283,8 @@ async function resolveMediaFile(payload) {
         return null;
       }
       const buf = Buffer.from(await res.arrayBuffer());
-      const ext = path.extname(String(payload.file_name || ".pdf")) || ".pdf";
+      const defaultExt = payload.type === "audio" ? ".webm" : ".pdf";
+      const ext = path.extname(String(payload.file_name || defaultExt)) || defaultExt;
       const tmpPath = path.join(
         os.tmpdir(),
         `wa-${crypto.randomBytes(8).toString("hex")}${ext}`,
@@ -303,6 +353,42 @@ export async function sendMessage(payload) {
           }
         }
       }
+    } else if (type === "audio") {
+      const media = await resolveMediaFile(payload);
+      if (!media) {
+        return {
+          success: false,
+          message: "Audio file not found on gateway host.",
+        };
+      }
+      const fileName = payload.file_name || path.basename(media.path);
+      const mimetype =
+        payload.mimetype ||
+        mimeFromFileName(fileName, "audio/ogg; codecs=opus");
+      try {
+        logger.info(
+          {
+            file_name: fileName,
+            mimetype,
+            media_path: media.path,
+            ptt: payload.ptt !== false,
+          },
+          "whatsapp.gateway.send_audio",
+        );
+        result = await entry.sock.sendMessage(jid, {
+          audio: fs.readFileSync(media.path),
+          mimetype,
+          ptt: payload.ptt !== false,
+        });
+      } finally {
+        if (media.cleanup) {
+          try {
+            fs.unlinkSync(media.path);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
     } else if (type === "document") {
       const media = await resolveMediaFile(payload);
       if (!media) {
@@ -311,11 +397,14 @@ export async function sendMessage(payload) {
           message: "Document file not found on gateway host.",
         };
       }
+      const fileName = payload.file_name || path.basename(media.path);
+      const mimetype =
+        payload.mimetype || mimeFromFileName(fileName, "application/pdf");
       try {
         result = await entry.sock.sendMessage(jid, {
           document: fs.readFileSync(media.path),
-          mimetype: "application/pdf",
-          fileName: payload.file_name || path.basename(media.path),
+          mimetype,
+          fileName,
           caption: payload.text ? String(payload.text) : undefined,
         });
       } finally {
