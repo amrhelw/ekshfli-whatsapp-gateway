@@ -3,6 +3,7 @@ import {
   disconnectSession,
   getSessionStatus,
   reconnectSession,
+  resetSession,
   restoreAllSessions,
   sendMessage,
   startSession,
@@ -72,6 +73,16 @@ app.post("/internal/sessions/:clinicId/disconnect", async (req, res) => {
     res.json({ success: true, data });
   } catch (err) {
     res.status(500).json({ success: false, message: err?.message || "Disconnect failed" });
+  }
+});
+
+app.post("/internal/sessions/:clinicId/reset", async (req, res) => {
+  const clinicId = Number(req.params.clinicId);
+  try {
+    const result = await resetSession(clinicId);
+    res.status(result.success ? 200 : 422).json(result);
+  } catch (err) {
+    res.status(500).json({ success: false, message: err?.message || "Reset failed" });
   }
 });
 

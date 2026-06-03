@@ -257,6 +257,66 @@ export async function reconnectSession(clinicId) {
   return startSession(clinicId, "qr", null, false);
 }
 
+/**
+ * Recover a stuck session without deleting auth on disk (not a full disconnect).
+ */
+export async function resetSession(clinicId) {
+  logger.info({ clinic_id: clinicId }, "whatsapp.session.reset");
+
+  const hadAuth = hasPersistedAuth(clinicId);
+  const existing = sessions.get(clinicId);
+
+  if (existing?.sock) {
+    try {
+      existing.sock.end(undefined);
+    } catch {
+      /* ignore */
+    }
+    existing.sock = null;
+  }
+
+  sessions.delete(clinicId);
+
+  try {
+    if (hadAuth) {
+      const data = await startSession(clinicId, "qr", null, true);
+      logger.info(
+        { clinic_id: clinicId, status: data.status },
+        "whatsapp.session.reset.success",
+      );
+
+      return { success: true, data };
+    }
+
+    const entry = entryFor(clinicId);
+    setEntryStatus(entry, "disconnected");
+    entry.qr = null;
+    entry.pairingCode = null;
+    entry.lastError = null;
+    const data = statusPayload(entry);
+    logger.info(
+      { clinic_id: clinicId, status: data.status },
+      "whatsapp.session.reset.success",
+    );
+
+    return { success: true, data };
+  } catch (err) {
+    logger.warn(
+      { clinic_id: clinicId, err: err?.message },
+      "whatsapp.session.reset.failed",
+    );
+    const entry = entryFor(clinicId);
+    setEntryStatus(entry, "disconnected");
+    entry.lastError = err?.message || "Session reset failed";
+
+    return {
+      success: false,
+      message: entry.lastError,
+      data: statusPayload(entry),
+    };
+  }
+}
+
 export async function disconnectSession(clinicId) {
   logger.info({ clinic_id: clinicId }, "whatsapp.gateway.connection.disconnect");
   return forceDisconnectEntry(clinicId, null);
