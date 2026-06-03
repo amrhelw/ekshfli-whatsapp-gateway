@@ -447,6 +447,10 @@ export async function sendMessage(payload) {
     } else if (type === "audio") {
       const media = await resolveMediaFile(payload);
       if (!media) {
+        logger.error(
+          { clinic_id: clinicId, to: payload.to, type },
+          "whatsapp.audio.send.error",
+        );
         return {
           success: false,
           message: "Audio file not found on gateway host.",
@@ -456,21 +460,43 @@ export async function sendMessage(payload) {
       const mimetype =
         payload.mimetype ||
         mimeFromFileName(fileName, "audio/ogg; codecs=opus");
+      const isWebm =
+        String(mimetype).toLowerCase().includes("webm") ||
+        String(fileName).toLowerCase().endsWith(".webm");
+      const usePtt =
+        payload.ptt !== false && !isWebm && payload.ptt !== "0";
+      const fileStat = fs.existsSync(media.path)
+        ? fs.statSync(media.path)
+        : null;
+      logger.info(
+        {
+          clinic_id: clinicId,
+          to: payload.to,
+          jid,
+          file_name: fileName,
+          mimetype,
+          media_path: media.path,
+          file_size: fileStat?.size ?? null,
+          ptt: usePtt,
+        },
+        "whatsapp.audio.send.start",
+      );
       try {
-        logger.info(
-          {
-            file_name: fileName,
-            mimetype,
-            media_path: media.path,
-            ptt: payload.ptt !== false,
-          },
-          "whatsapp.gateway.send_audio",
-        );
         result = await entry.sock.sendMessage(jid, {
           audio: fs.readFileSync(media.path),
           mimetype,
-          ptt: payload.ptt !== false,
+          ptt: usePtt,
         });
+      } catch (audioErr) {
+        logger.error(
+          {
+            clinic_id: clinicId,
+            to: payload.to,
+            error: audioErr?.message || String(audioErr),
+          },
+          "whatsapp.audio.send.error",
+        );
+        throw audioErr;
       } finally {
         if (media.cleanup) {
           try {
@@ -513,6 +539,29 @@ export async function sendMessage(payload) {
 
     const messageId = result?.key?.id || null;
 
+    if (!messageId) {
+      logger.error(
+        { clinic_id: clinicId, to: payload.to, type, jid },
+        type === "audio" ? "whatsapp.audio.send.error" : "whatsapp.gateway.send_no_message_id",
+      );
+      return {
+        success: false,
+        message: "WhatsApp did not return a message id (delivery not confirmed).",
+      };
+    }
+
+    if (type === "audio") {
+      logger.info(
+        {
+          clinic_id: clinicId,
+          to: payload.to,
+          message_id: messageId,
+          jid,
+        },
+        "whatsapp.audio.send.success",
+      );
+    }
+
     return {
       success: true,
       data: {
@@ -522,6 +571,12 @@ export async function sendMessage(payload) {
       },
     };
   } catch (err) {
+    if ((payload.type || "text") === "audio") {
+      logger.error(
+        { clinic_id: clinicId, to: payload.to, error: err?.message || String(err) },
+        "whatsapp.audio.send.error",
+      );
+    }
     return { success: false, message: err?.message || "Send failed" };
   }
 }
