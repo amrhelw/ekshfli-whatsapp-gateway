@@ -45,9 +45,14 @@ app.post("/internal/sessions/:clinicId/start", async (req, res) => {
   }
 });
 
-app.get("/internal/sessions/:clinicId/status", (req, res) => {
+app.get("/internal/sessions/:clinicId/status", async (req, res) => {
   const clinicId = Number(req.params.clinicId);
-  res.json({ success: true, data: getSessionStatus(clinicId) });
+  try {
+    const data = await getSessionStatus(clinicId);
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err?.message || "Status failed" });
+  }
 });
 
 app.post("/internal/sessions/:clinicId/reconnect", async (req, res) => {

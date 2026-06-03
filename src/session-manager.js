@@ -12,6 +12,8 @@ import makeWASocket, {
 
 const logger = pino({ level: process.env.LOG_LEVEL || "warn" });
 
+const STALE_CONNECTING_MS = Number(process.env.WHATSAPP_STALE_CONNECTING_MS || 5 * 60 * 1000);
+
 /** @type {Map<number, SessionEntry>} */
 const sessions = new Map();
 
@@ -25,6 +27,7 @@ const sessions = new Map();
  * @property {string|null} waJid
  * @property {string|null} profileName
  * @property {string|null} lastError
+ * @property {number|null} statusSince
  * @property {import('@whiskeysockets/baileys').WASocket|null} sock
  * @property {string} authDir
  */
@@ -53,12 +56,61 @@ function entryFor(clinicId) {
       waJid: null,
       profileName: null,
       lastError: null,
+      statusSince: null,
       sock: null,
       authDir: authDirFor(clinicId),
     };
     sessions.set(clinicId, entry);
   }
   return entry;
+}
+
+function setEntryStatus(entry, status) {
+  const prev = entry.status;
+  entry.status = status;
+  if (prev !== status) {
+    if (status === "connecting" || status === "reconnecting") {
+      entry.statusSince = Date.now();
+    } else {
+      entry.statusSince = null;
+    }
+    logger.info(
+      { clinic_id: entry.clinicId, from: prev, to: status },
+      "whatsapp.gateway.connection.status",
+    );
+  }
+}
+
+function isStalePendingStatus(entry) {
+  if (!entry.statusSince) return false;
+  if (entry.status !== "connecting" && entry.status !== "reconnecting") return false;
+  return Date.now() - entry.statusSince > STALE_CONNECTING_MS;
+}
+
+async function forceDisconnectEntry(clinicId, reason = null) {
+  const entry = entryFor(clinicId);
+  if (entry.sock) {
+    try {
+      await entry.sock.logout();
+    } catch {
+      try {
+        entry.sock.end(undefined);
+      } catch {
+        /* ignore */
+      }
+    }
+    entry.sock = null;
+  }
+  entry.qr = null;
+  entry.pairingCode = null;
+  entry.lastError = reason;
+  setEntryStatus(entry, "disconnected");
+  if (fs.existsSync(entry.authDir)) {
+    fs.rmSync(entry.authDir, { recursive: true, force: true });
+  }
+  sessions.delete(clinicId);
+  logger.warn({ clinic_id: clinicId, reason }, "whatsapp.gateway.connection.stale_recovery");
+  return statusPayload(entry);
 }
 
 function hasPersistedAuth(clinicId) {
@@ -79,27 +131,19 @@ function statusPayload(entry) {
   };
 }
 
-/** Clinic-scoped status: restores from disk when auth exists but memory entry is cold. */
+/** Report live session state only — no implicit reconnect on status polls. */
 export async function getSessionStatus(clinicId) {
   const entry = entryFor(clinicId);
-  const persisted = hasPersistedAuth(clinicId);
 
-  if (
-    persisted &&
-    entry.status === "disconnected" &&
-    !entry.sock
-  ) {
-    entry.status = "reconnecting";
-    startSession(clinicId, "qr", null, true).catch((err) => {
-      entry.lastError = err?.message || "Restore failed";
-      entry.status = "disconnected";
-    });
-
-    return statusPayload(entry);
+  if (isStalePendingStatus(entry)) {
+    return forceDisconnectEntry(
+      clinicId,
+      "Connection timed out while connecting. Please scan QR again.",
+    );
   }
 
-  if (persisted && entry.status === "disconnected" && entry.sock) {
-    entry.status = "connected";
+  if (hasPersistedAuth(clinicId) && entry.status === "disconnected" && entry.sock) {
+    setEntryStatus(entry, "connected");
   }
 
   return statusPayload(entry);
@@ -121,8 +165,15 @@ export async function restoreAllSessions() {
 }
 
 export async function startSession(clinicId, method = "qr", phone = null, isRestore = false) {
+  if (isStalePendingStatus(entryFor(clinicId))) {
+    await forceDisconnectEntry(
+      clinicId,
+      "Previous connection attempt timed out. Starting fresh.",
+    );
+  }
+
   const entry = entryFor(clinicId);
-  entry.status = "connecting";
+  setEntryStatus(entry, "connecting");
   entry.qr = null;
   entry.pairingCode = null;
   entry.lastError = null;
@@ -160,11 +211,11 @@ export async function startSession(clinicId, method = "qr", phone = null, isRest
       } catch {
         entry.qr = qr;
       }
-      entry.status = "connecting";
+      setEntryStatus(entry, "connecting");
     }
 
     if (connection === "open") {
-      entry.status = "connected";
+      setEntryStatus(entry, "connected");
       entry.qr = null;
       entry.pairingCode = null;
       const user = sock.user;
@@ -176,10 +227,10 @@ export async function startSession(clinicId, method = "qr", phone = null, isRest
     if (connection === "close") {
       const code = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = code !== DisconnectReason.loggedOut;
-      entry.status = shouldReconnect ? "reconnecting" : "disconnected";
+      setEntryStatus(entry, shouldReconnect ? "reconnecting" : "disconnected");
       entry.lastError = lastDisconnect?.error?.message || "Connection closed";
 
-      if (shouldReconnect && !isRestore) {
+      if (shouldReconnect) {
         setTimeout(() => startSession(clinicId, method, phone, true), 3000);
       }
     }
@@ -191,10 +242,10 @@ export async function startSession(clinicId, method = "qr", phone = null, isRest
     try {
       const code = await sock.requestPairingCode(digits);
       entry.pairingCode = code;
-      entry.status = "connecting";
+      setEntryStatus(entry, "connecting");
     } catch (err) {
       entry.lastError = err?.message || "Pairing code failed";
-      entry.status = "disconnected";
+      setEntryStatus(entry, "disconnected");
     }
   }
 
@@ -202,33 +253,13 @@ export async function startSession(clinicId, method = "qr", phone = null, isRest
 }
 
 export async function reconnectSession(clinicId) {
-  return startSession(clinicId, "qr", null, true);
+  logger.info({ clinic_id: clinicId }, "whatsapp.gateway.connection.reconnect");
+  return startSession(clinicId, "qr", null, false);
 }
 
 export async function disconnectSession(clinicId) {
-  const entry = entryFor(clinicId);
-  if (entry.sock) {
-    try {
-      await entry.sock.logout();
-    } catch {
-      try {
-        entry.sock.end(undefined);
-      } catch {
-        /* ignore */
-      }
-    }
-    entry.sock = null;
-  }
-
-  entry.status = "disconnected";
-  entry.qr = null;
-  entry.pairingCode = null;
-
-  if (fs.existsSync(entry.authDir)) {
-    fs.rmSync(entry.authDir, { recursive: true, force: true });
-  }
-
-  return statusPayload(entry);
+  logger.info({ clinic_id: clinicId }, "whatsapp.gateway.connection.disconnect");
+  return forceDisconnectEntry(clinicId, null);
 }
 
 function phoneToJid(phone) {
