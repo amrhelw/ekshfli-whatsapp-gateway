@@ -13,6 +13,12 @@ import makeWASocket, {
 const logger = pino({ level: process.env.LOG_LEVEL || "warn" });
 
 const STALE_CONNECTING_MS = Number(process.env.WHATSAPP_STALE_CONNECTING_MS || 5 * 60 * 1000);
+const QR_LOCK_MS = Number(process.env.WHATSAPP_QR_LOCK_MS || 90 * 1000);
+
+function autoRestoreEnabled() {
+  const v = String(process.env.WHATSAPP_AUTO_RESTORE ?? "0").toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
 
 /** @type {Map<number, SessionEntry>} */
 const sessions = new Map();
@@ -221,6 +227,11 @@ export async function getSessionStatus(clinicId) {
 }
 
 export async function restoreAllSessions() {
+  if (!autoRestoreEnabled()) {
+    logger.info("whatsapp.gateway.restore_skipped");
+    return;
+  }
+
   const root = sessionsRoot();
   if (!fs.existsSync(root)) return;
 
@@ -242,7 +253,23 @@ export async function startSession(
   isRestore = false,
   options = {},
 ) {
-  const { staleAuthRetry = false } = options;
+  const { staleAuthRetry = false, forceNewSocket = false } = options;
+
+  const existingLive = sessions.get(clinicId);
+  if (
+    !forceNewSocket &&
+    !staleAuthRetry &&
+    !isRestore &&
+    existingLive?.sock &&
+    existingLive.status === "connecting" &&
+    existingLive.qr
+  ) {
+    logger.info(
+      { clinic_id: clinicId, qr_length: qrLength(existingLive.qr) },
+      "whatsapp.connect.reuse_active_session",
+    );
+    return statusPayload(existingLive);
+  }
 
   if (isStalePendingStatus(entryFor(clinicId))) {
     await forceDisconnectEntry(
@@ -253,9 +280,12 @@ export async function startSession(
 
   const entry = entryFor(clinicId);
   setEntryStatus(entry, "connecting");
-  entry.qr = null;
+  if (!entry.qr || staleAuthRetry || forceNewSocket) {
+    entry.qr = null;
+  }
   entry.pairingCode = null;
   entry.lastError = null;
+  entry.qrLockedUntil = null;
 
   logger.info(
     {
@@ -286,6 +316,9 @@ export async function startSession(
     logger,
     printQRInTerminal: false,
     generateHighQualityLinkPreview: false,
+    browser: ["Ekshfli", "Clinic", "1.0.0"],
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
   });
 
   entry.sock = sock;
@@ -296,16 +329,20 @@ export async function startSession(
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      try {
-        entry.qr = await qrcode.toDataURL(qr);
-      } catch {
-        entry.qr = qr;
+      const locked = entry.qrLockedUntil && Date.now() < entry.qrLockedUntil;
+      if (!locked || !entry.qr) {
+        try {
+          entry.qr = await qrcode.toDataURL(qr);
+        } catch {
+          entry.qr = qr;
+        }
+        entry.qrLockedUntil = Date.now() + QR_LOCK_MS;
+        setEntryStatus(entry, "connecting");
+        logger.info(
+          { clinic_id: clinicId, qr_length: qrLength(entry.qr), qr_locked_ms: QR_LOCK_MS },
+          "whatsapp.qr.response",
+        );
       }
-      setEntryStatus(entry, "connecting");
-      logger.info(
-        { clinic_id: clinicId, qr_length: qrLength(entry.qr) },
-        "whatsapp.qr.response",
-      );
     }
 
     if (connection === "open") {
@@ -321,16 +358,56 @@ export async function startSession(
     if (connection === "close") {
       const code = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = code === DisconnectReason.loggedOut;
-      const shouldReconnect = !loggedOut && isRestore;
-      setEntryStatus(entry, shouldReconnect ? "reconnecting" : "disconnected");
-      entry.lastError = lastDisconnect?.error?.message || "Connection closed";
+      const restartRequired = code === DisconnectReason.restartRequired;
+      const errMsg = lastDisconnect?.error?.message || "Connection closed";
+      const wasConnecting = entry.status === "connecting" || entry.status === "reconnecting";
 
-      if (loggedOut && fs.existsSync(entry.authDir)) {
+      logger.error(
+        {
+          clinic_id: clinicId,
+          status_code: code,
+          message: errMsg,
+          logged_out: loggedOut,
+          restart_required: restartRequired,
+          is_restore: isRestore,
+          was_connecting: wasConnecting,
+          had_phone: Boolean(entry.phoneNumber),
+        },
+        "whatsapp.gateway.connection.close",
+      );
+
+      const shouldReconnect = !loggedOut && !restartRequired && isRestore;
+      setEntryStatus(entry, shouldReconnect ? "reconnecting" : "disconnected");
+      entry.lastError = errMsg;
+
+      const mustClearAuth =
+        loggedOut ||
+        restartRequired ||
+        code === 401 ||
+        code === 403 ||
+        (wasConnecting && !isRestore && !entry.phoneNumber);
+
+      if (mustClearAuth && fs.existsSync(entry.authDir)) {
         try {
           fs.rmSync(entry.authDir, { recursive: true, force: true });
+          logger.warn(
+            { clinic_id: clinicId, status_code: code },
+            "whatsapp.gateway.auth_cleared_after_close",
+          );
         } catch {
           /* ignore */
         }
+      }
+
+      entry.qr = null;
+      entry.qrLockedUntil = null;
+      if (entry.sock) {
+        try {
+          entry.sock.end(undefined);
+        } catch {
+          /* ignore */
+        }
+        entry.sock = null;
       }
 
       if (shouldReconnect) {
@@ -381,7 +458,10 @@ export async function startSession(
       "whatsapp.connect.clear_stale_auth",
     );
     await forceDisconnectEntry(clinicId, "Cleared invalid session; scan a new QR.");
-    return startSession(clinicId, method, phone, false, { staleAuthRetry: true });
+    return startSession(clinicId, method, phone, false, {
+      staleAuthRetry: true,
+      forceNewSocket: true,
+    });
   }
 
   return data;
@@ -389,6 +469,10 @@ export async function startSession(
 
 export async function reconnectSession(clinicId) {
   logger.info({ clinic_id: clinicId }, "whatsapp.gateway.connection.reconnect");
+  const live = sessions.get(clinicId);
+  if (live?.status === "connecting" && live.qr) {
+    return statusPayload(live);
+  }
   return startSession(clinicId, "qr", null, false);
 }
 
