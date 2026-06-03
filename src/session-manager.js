@@ -218,6 +218,12 @@ async function resolveMediaFile(payload) {
     if (token) {
       headers["X-Gateway-Token"] = token;
     }
+    if (payload.media_fetch_authorization) {
+      headers["Authorization"] = String(payload.media_fetch_authorization);
+    }
+    if (payload.media_fetch_x_api_key) {
+      headers["x-api-key"] = String(payload.media_fetch_x_api_key);
+    }
     try {
       const res = await fetch(String(mediaUrl), { headers });
       if (!res.ok) {
