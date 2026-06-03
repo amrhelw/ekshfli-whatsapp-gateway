@@ -15,6 +15,10 @@ const TOKEN = process.env.GATEWAY_TOKEN || "";
 app.use(express.json({ limit: "25mb" }));
 
 app.use((req, res, next) => {
+  console.log({
+    expected: process.env.GATEWAY_TOKEN,
+    received: req.headers["x-gateway-token"],
+  });
   if (!TOKEN) {
     return next();
   }
