@@ -1,4 +1,6 @@
+import crypto from "crypto";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import pino from "pino";
 import qrcode from "qrcode";
@@ -204,6 +206,60 @@ function phoneToJid(phone) {
   return `${digits}@s.whatsapp.net`;
 }
 
+/**
+ * Resolve media from gateway-local path or download from media_url (API-hosted fetch).
+ * @returns {Promise<{ path: string, cleanup: boolean }|null>}
+ */
+async function resolveMediaFile(payload) {
+  const mediaUrl = payload.media_url;
+  if (mediaUrl) {
+    const headers = {};
+    const token = process.env.GATEWAY_TOKEN || "";
+    if (token) {
+      headers["X-Gateway-Token"] = token;
+    }
+    try {
+      const res = await fetch(String(mediaUrl), { headers });
+      if (!res.ok) {
+        logger.warn(
+          { media_url: mediaUrl, status: res.status },
+          "whatsapp.gateway.media_url_fetch_failed",
+        );
+        return null;
+      }
+      const buf = Buffer.from(await res.arrayBuffer());
+      const ext = path.extname(String(payload.file_name || ".pdf")) || ".pdf";
+      const tmpPath = path.join(
+        os.tmpdir(),
+        `wa-${crypto.randomBytes(8).toString("hex")}${ext}`,
+      );
+      fs.writeFileSync(tmpPath, buf);
+      logger.info(
+        { media_url: mediaUrl, tmp_path: tmpPath, bytes: buf.length },
+        "whatsapp.gateway.media_url_fetched",
+      );
+      return { path: tmpPath, cleanup: true };
+    } catch (err) {
+      logger.warn(
+        { media_url: mediaUrl, err: err?.message },
+        "whatsapp.gateway.media_url_fetch_error",
+      );
+      return null;
+    }
+  }
+
+  const mediaPath = payload.media_path;
+  if (mediaPath && fs.existsSync(mediaPath)) {
+    return { path: mediaPath, cleanup: false };
+  }
+
+  if (mediaPath) {
+    logger.warn({ media_path: mediaPath }, "whatsapp.gateway.media_path_missing");
+  }
+
+  return null;
+}
+
 export async function sendMessage(payload) {
   const clinicId = Number(payload.clinic_id);
   const entry = entryFor(clinicId);
@@ -220,25 +276,51 @@ export async function sendMessage(payload) {
     if (type === "text") {
       result = await entry.sock.sendMessage(jid, { text: String(payload.text || "") });
     } else if (type === "image") {
-      const mediaPath = payload.media_path;
-      if (!mediaPath || !fs.existsSync(mediaPath)) {
-        return { success: false, message: "Image file not found on gateway host." };
+      const media = await resolveMediaFile(payload);
+      if (!media) {
+        return {
+          success: false,
+          message: "Image file not found on gateway host.",
+        };
       }
-      result = await entry.sock.sendMessage(jid, {
-        image: fs.readFileSync(mediaPath),
-        caption: payload.text ? String(payload.text) : undefined,
-      });
+      try {
+        result = await entry.sock.sendMessage(jid, {
+          image: fs.readFileSync(media.path),
+          caption: payload.text ? String(payload.text) : undefined,
+        });
+      } finally {
+        if (media.cleanup) {
+          try {
+            fs.unlinkSync(media.path);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
     } else if (type === "document") {
-      const mediaPath = payload.media_path;
-      if (!mediaPath || !fs.existsSync(mediaPath)) {
-        return { success: false, message: "Document file not found on gateway host." };
+      const media = await resolveMediaFile(payload);
+      if (!media) {
+        return {
+          success: false,
+          message: "Document file not found on gateway host.",
+        };
       }
-      result = await entry.sock.sendMessage(jid, {
-        document: fs.readFileSync(mediaPath),
-        mimetype: "application/pdf",
-        fileName: payload.file_name || path.basename(mediaPath),
-        caption: payload.text ? String(payload.text) : undefined,
-      });
+      try {
+        result = await entry.sock.sendMessage(jid, {
+          document: fs.readFileSync(media.path),
+          mimetype: "application/pdf",
+          fileName: payload.file_name || path.basename(media.path),
+          caption: payload.text ? String(payload.text) : undefined,
+        });
+      } finally {
+        if (media.cleanup) {
+          try {
+            fs.unlinkSync(media.path);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
     } else {
       return { success: false, message: "Unsupported message type." };
     }
