@@ -1,6 +1,7 @@
 import express from "express";
 import {
   disconnectSession,
+  GATEWAY_BUILD_ID,
   getSessionStatus,
   reconnectSession,
   resetSession,
@@ -8,6 +9,17 @@ import {
   sendMessage,
   startSession,
 } from "./session-manager.js";
+import pino from "pino";
+
+const bootLogger = pino({ level: process.env.LOG_LEVEL || "info" });
+bootLogger.info(
+  {
+    build_id: GATEWAY_BUILD_ID,
+    auto_restore: process.env.WHATSAPP_AUTO_RESTORE ?? "0",
+    sessions_dir: process.env.SESSIONS_DIR || "./sessions",
+  },
+  "whatsapp.gateway.build",
+);
 
 const app = express();
 const PORT = Number(process.env.PORT || 3100);
@@ -31,7 +43,23 @@ app.use((req, res, next) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ success: true, service: "ekshfli-whatsapp-gateway" });
+  res.json({
+    success: true,
+    service: "ekshfli-whatsapp-gateway",
+    build_id: GATEWAY_BUILD_ID,
+    expected_log_events: [
+      "whatsapp.gateway.build",
+      "whatsapp.connect.start",
+      "whatsapp.qr.generated",
+      "whatsapp.qr.delivered",
+      "whatsapp.qr.scanned",
+      "whatsapp.auth.loaded",
+      "whatsapp.auth.saved",
+      "whatsapp.session.close",
+      "whatsapp.session.restart_required",
+      "whatsapp.session.open",
+    ],
+  });
 });
 
 app.post("/internal/sessions/:clinicId/start", async (req, res) => {

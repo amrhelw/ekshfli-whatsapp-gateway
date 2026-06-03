@@ -12,6 +12,13 @@ import makeWASocket, {
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
+/** Logged at boot — must match Railway deploy commit to get new pairing logs. */
+export const GATEWAY_BUILD_ID =
+  process.env.RAILWAY_GIT_COMMIT_SHA ||
+  process.env.GIT_COMMIT ||
+  process.env.GATEWAY_BUILD_ID ||
+  "local-dev";
+
 const STALE_CONNECTING_MS = Number(
   process.env.WHATSAPP_STALE_CONNECTING_MS || 5 * 60 * 1000,
 );
@@ -86,7 +93,29 @@ function listAuthFiles(clinicId) {
   return out;
 }
 
-function destroyAuthDir(clinicId, reason) {
+/** Only these reasons may delete creds.json / keys (per pairing policy). */
+const AUTH_DESTROY_REASONS = new Set([
+  "logged_out",
+  "force_disconnect",
+  "fresh_qr_connect",
+  "explicit_reset",
+  "explicit_disconnect",
+]);
+
+function destroyAuthDir(clinicId, reason, caller = "unknown") {
+  const normalized = String(reason || "force_disconnect");
+  const allowed =
+    AUTH_DESTROY_REASONS.has(normalized) ||
+    normalized.startsWith("logged_out_");
+
+  if (!allowed) {
+    logger.warn(
+      { clinic_id: clinicId, reason: normalized, caller, build_id: GATEWAY_BUILD_ID },
+      "whatsapp.auth.destroy_blocked",
+    );
+    return false;
+  }
+
   const dir = authDirFor(clinicId);
   const filesBefore = listAuthFiles(clinicId);
   if (fs.existsSync(dir)) {
@@ -98,10 +127,13 @@ function destroyAuthDir(clinicId, reason) {
       auth_dir: dir,
       files_removed: filesBefore.length,
       had_creds: filesBefore.some((f) => f.endsWith("creds.json")),
-      reason,
+      reason: normalized,
+      caller,
+      build_id: GATEWAY_BUILD_ID,
     },
     "whatsapp.session.destroy",
   );
+  return true;
 }
 
 function hasPersistedAuth(clinicId) {
@@ -159,6 +191,13 @@ function isStalePendingStatus(entry) {
   if (entry.status !== "connecting" && entry.status !== "reconnecting") {
     return false;
   }
+  if (entry.pairingInProgress) {
+    const qrGraceUntil =
+      (entry.qrExpiresAt || 0) + Number(process.env.WHATSAPP_QR_SCAN_GRACE_MS || 120000);
+    if (entry.qr && Date.now() < qrGraceUntil) {
+      return false;
+    }
+  }
   return Date.now() - entry.statusSince > STALE_CONNECTING_MS;
 }
 
@@ -210,10 +249,20 @@ async function forceDisconnectEntry(clinicId, reason = null) {
   entry.profileName = null;
   entry.lastError = reason;
   setEntryStatus(entry, "disconnected");
-  destroyAuthDir(clinicId, reason || "force_disconnect");
+  const destroyReason =
+    reason && String(reason).includes("reset")
+      ? "explicit_reset"
+      : "explicit_disconnect";
+  destroyAuthDir(clinicId, destroyReason, "forceDisconnectEntry");
   sessions.delete(clinicId);
   logger.warn(
-    { clinic_id: clinicId, reason, at: iso(Date.now()) },
+    {
+      clinic_id: clinicId,
+      reason,
+      destroy_reason: destroyReason,
+      build_id: GATEWAY_BUILD_ID,
+      at: iso(Date.now()),
+    },
     "whatsapp.session.reset",
   );
   return statusPayload(entryFor(clinicId));
@@ -387,10 +436,35 @@ function bindSocketEvents(entry, sock, clinicId, method, phone, isRestore, gener
         return;
       }
 
-      if (loggedOut || code === 401 || code === 403) {
-        destroyAuthDir(clinicId, `logged_out_${code}`);
+      if (loggedOut) {
+        destroyAuthDir(clinicId, `logged_out_${code}`, "connection.close");
+        logger.warn(
+          {
+            clinic_id: clinicId,
+            status_code: code,
+            disconnect_reason: disconnectReasonLabel(code),
+            pairing_phase: entry.pairingInProgress
+              ? "during_or_after_scan"
+              : wasConnecting
+                ? "connecting_before_open"
+                : "idle",
+            had_persisted_auth: hasPersistedAuth(clinicId),
+            at: iso(Date.now()),
+          },
+          "whatsapp.auth.cleared_logged_out",
+        );
       } else if (wasConnecting && !entry.phoneNumber && !hasPersistedAuth(clinicId)) {
-        destroyAuthDir(clinicId, "pairing_failed_no_auth");
+        logger.warn(
+          {
+            clinic_id: clinicId,
+            status_code: code,
+            disconnect_reason: disconnectReasonLabel(code),
+            restart_required: restartRequired,
+            pairing_phase: "during_scan_no_creds_yet",
+            at: iso(Date.now()),
+          },
+          "whatsapp.pairing.failed_no_auth_keep_files",
+        );
       } else if (wasConnecting && !entry.phoneNumber && hasPersistedAuth(clinicId)) {
         logger.info(
           { clinic_id: clinicId },
@@ -479,7 +553,7 @@ async function startSessionImpl(
   const entry = entryFor(clinicId);
 
   if (method === "qr" && !isRestore && !afterRestartRequired && !staleAuthRetry) {
-    destroyAuthDir(clinicId, "fresh_qr_connect");
+    destroyAuthDir(clinicId, "fresh_qr_connect", "startSessionImpl");
     await endSocket(entry);
   }
 
@@ -594,7 +668,7 @@ async function startSessionImpl(
     !staleAuthRetry
   ) {
     logger.warn({ clinic_id: clinicId }, "whatsapp.connect.retry_after_fail");
-    await forceDisconnectEntry(clinicId, "connect_failed_retry");
+    await endSocket(entryFor(clinicId));
     return startSession(clinicId, method, phone, false, {
       staleAuthRetry: true,
       forceNewSocket: true,
