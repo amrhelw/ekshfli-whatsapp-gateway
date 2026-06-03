@@ -128,25 +128,96 @@ function statusPayload(entry) {
     wa_jid: entry.waJid,
     profile_name: entry.profileName,
     last_error: entry.lastError,
+    session_id: String(entry.clinicId),
   };
+}
+
+function qrLength(qr) {
+  return qr ? String(qr).length : 0;
+}
+
+/**
+ * Baileys emits QR asynchronously after the socket is created.
+ */
+function waitForQr(entry, timeoutMs = 15000) {
+  const waitMs = Number(process.env.QR_WAIT_MS || timeoutMs);
+  return new Promise((resolve) => {
+    if (entry.qr) {
+      return resolve(entry.qr);
+    }
+    const deadline = Date.now() + waitMs;
+    const timer = setInterval(() => {
+      if (entry.qr) {
+        clearInterval(timer);
+        resolve(entry.qr);
+        return;
+      }
+      if (entry.status === "connected") {
+        clearInterval(timer);
+        resolve(null);
+        return;
+      }
+      if (entry.status === "disconnected" && Date.now() > deadline - 1000) {
+        clearInterval(timer);
+        resolve(null);
+        return;
+      }
+      if (Date.now() >= deadline) {
+        clearInterval(timer);
+        resolve(null);
+      }
+    }, 250);
+  });
 }
 
 /** Report live session state only — no implicit reconnect on status polls. */
 export async function getSessionStatus(clinicId) {
   const entry = entryFor(clinicId);
 
+  logger.info(
+    {
+      clinic_id: clinicId,
+      status: entry.status,
+      qr_length: qrLength(entry.qr),
+      has_sock: Boolean(entry.sock),
+      has_persisted_auth: hasPersistedAuth(clinicId),
+    },
+    "whatsapp.status.request",
+  );
+
   if (isStalePendingStatus(entry)) {
-    return forceDisconnectEntry(
+    const data = await forceDisconnectEntry(
       clinicId,
       "Connection timed out while connecting. Please scan QR again.",
     );
+    logger.info(
+      { clinic_id: clinicId, status: data.status, qr_length: qrLength(data.qr) },
+      "whatsapp.status.response",
+    );
+    return data;
   }
 
-  if (hasPersistedAuth(clinicId) && entry.status === "disconnected" && entry.sock) {
-    setEntryStatus(entry, "connected");
+  if (
+    entry.status === "connecting" &&
+    !entry.qr &&
+    entry.sock &&
+    !hasPersistedAuth(clinicId)
+  ) {
+    await waitForQr(entry, 5000);
   }
 
-  return statusPayload(entry);
+  const data = statusPayload(entry);
+  logger.info(
+    {
+      clinic_id: clinicId,
+      status: data.status,
+      qr_length: qrLength(data.qr),
+      session_id: data.session_id,
+    },
+    "whatsapp.status.response",
+  );
+
+  return data;
 }
 
 export async function restoreAllSessions() {
@@ -164,7 +235,15 @@ export async function restoreAllSessions() {
   }
 }
 
-export async function startSession(clinicId, method = "qr", phone = null, isRestore = false) {
+export async function startSession(
+  clinicId,
+  method = "qr",
+  phone = null,
+  isRestore = false,
+  options = {},
+) {
+  const { staleAuthRetry = false } = options;
+
   if (isStalePendingStatus(entryFor(clinicId))) {
     await forceDisconnectEntry(
       clinicId,
@@ -177,6 +256,17 @@ export async function startSession(clinicId, method = "qr", phone = null, isRest
   entry.qr = null;
   entry.pairingCode = null;
   entry.lastError = null;
+
+  logger.info(
+    {
+      clinic_id: clinicId,
+      method,
+      is_restore: isRestore,
+      stale_auth_retry: staleAuthRetry,
+      has_persisted_auth: hasPersistedAuth(clinicId),
+    },
+    "whatsapp.connect.start",
+  );
 
   if (entry.sock) {
     try {
@@ -212,6 +302,10 @@ export async function startSession(clinicId, method = "qr", phone = null, isRest
         entry.qr = qr;
       }
       setEntryStatus(entry, "connecting");
+      logger.info(
+        { clinic_id: clinicId, qr_length: qrLength(entry.qr) },
+        "whatsapp.qr.response",
+      );
     }
 
     if (connection === "open") {
@@ -226,9 +320,18 @@ export async function startSession(clinicId, method = "qr", phone = null, isRest
 
     if (connection === "close") {
       const code = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
+      const loggedOut = code === DisconnectReason.loggedOut;
+      const shouldReconnect = !loggedOut && isRestore;
       setEntryStatus(entry, shouldReconnect ? "reconnecting" : "disconnected");
       entry.lastError = lastDisconnect?.error?.message || "Connection closed";
+
+      if (loggedOut && fs.existsSync(entry.authDir)) {
+        try {
+          fs.rmSync(entry.authDir, { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
+      }
 
       if (shouldReconnect) {
         setTimeout(() => startSession(clinicId, method, phone, true), 3000);
@@ -249,7 +352,39 @@ export async function startSession(clinicId, method = "qr", phone = null, isRest
     }
   }
 
-  return statusPayload(entry);
+  if (method === "qr" && !isRestore) {
+    logger.info({ clinic_id: clinicId }, "whatsapp.qr.request");
+    await waitForQr(entry);
+  }
+
+  let data = statusPayload(entry);
+  logger.info(
+    {
+      clinic_id: clinicId,
+      status: data.status,
+      qr_length: qrLength(data.qr),
+      session_id: data.session_id,
+    },
+    "whatsapp.connect.response",
+  );
+
+  if (
+    method === "qr" &&
+    !isRestore &&
+    !data.qr &&
+    data.status === "disconnected" &&
+    hasPersistedAuth(clinicId) &&
+    !staleAuthRetry
+  ) {
+    logger.warn(
+      { clinic_id: clinicId },
+      "whatsapp.connect.clear_stale_auth",
+    );
+    await forceDisconnectEntry(clinicId, "Cleared invalid session; scan a new QR.");
+    return startSession(clinicId, method, phone, false, { staleAuthRetry: true });
+  }
+
+  return data;
 }
 
 export async function reconnectSession(clinicId) {
@@ -258,44 +393,19 @@ export async function reconnectSession(clinicId) {
 }
 
 /**
- * Recover a stuck session without deleting auth on disk (not a full disconnect).
+ * Full clinic-scoped reset: memory session, auth files on disk, QR state.
+ * Does not auto-start — admin uses Connect WhatsApp for a fresh QR.
  */
 export async function resetSession(clinicId) {
   logger.info({ clinic_id: clinicId }, "whatsapp.session.reset");
 
-  const hadAuth = hasPersistedAuth(clinicId);
-  const existing = sessions.get(clinicId);
-
-  if (existing?.sock) {
-    try {
-      existing.sock.end(undefined);
-    } catch {
-      /* ignore */
-    }
-    existing.sock = null;
-  }
-
-  sessions.delete(clinicId);
-
   try {
-    if (hadAuth) {
-      const data = await startSession(clinicId, "qr", null, true);
-      logger.info(
-        { clinic_id: clinicId, status: data.status },
-        "whatsapp.session.reset.success",
-      );
-
-      return { success: true, data };
-    }
-
-    const entry = entryFor(clinicId);
-    setEntryStatus(entry, "disconnected");
-    entry.qr = null;
-    entry.pairingCode = null;
-    entry.lastError = null;
-    const data = statusPayload(entry);
+    const data = await forceDisconnectEntry(
+      clinicId,
+      "Session reset. Use Connect WhatsApp to scan a new QR.",
+    );
     logger.info(
-      { clinic_id: clinicId, status: data.status },
+      { clinic_id: clinicId, status: data.status, had_auth_cleared: true },
       "whatsapp.session.reset.success",
     );
 
