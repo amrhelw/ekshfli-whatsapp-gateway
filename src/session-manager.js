@@ -23,6 +23,11 @@ import {
   traceSessionCleanup,
   traceSocketDestroy,
 } from "./session-trace.js";
+import {
+  logVoiceTrace,
+  sanitizePayloadForLog,
+  voiceFileInfo,
+} from "./voice-trace.js";
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
@@ -515,6 +520,10 @@ function mimeFromFileName(fileName, fallback = "application/octet-stream") {
  * Resolve media from gateway-local path or download from media_url (API-hosted fetch).
  * @returns {Promise<{ path: string, cleanup: boolean }|null>}
  */
+/**
+ * @param {Record<string, unknown>} payload
+ * @returns {Promise<{ path: string, cleanup: boolean, bytes: number, source: string }|null>}
+ */
 async function resolveMediaFile(payload) {
   const mediaUrl = payload.media_url;
   if (mediaUrl) {
@@ -532,6 +541,13 @@ async function resolveMediaFile(payload) {
     try {
       const res = await fetch(String(mediaUrl), { headers });
       if (!res.ok) {
+        if (payload.type === "audio") {
+          logVoiceTrace(logger, "whatsapp.voice.trace.error", payload, {
+            stage: "media_url_fetch",
+            error: `HTTP ${res.status}`,
+            media_url: mediaUrl,
+          });
+        }
         logger.warn(
           { media_url: mediaUrl, status: res.status },
           "whatsapp.gateway.media_url_fetch_failed",
@@ -547,12 +563,27 @@ async function resolveMediaFile(payload) {
         `wa-${crypto.randomBytes(8).toString("hex")}${ext}`,
       );
       fs.writeFileSync(tmpPath, buf);
+      if (payload.type === "audio") {
+        logVoiceTrace(logger, "whatsapp.voice.trace.downloaded", payload, {
+          media_url: mediaUrl,
+          downloaded_path: tmpPath,
+          file_size: buf.length,
+          http_status: res.status,
+        });
+      }
       logger.info(
         { media_url: mediaUrl, tmp_path: tmpPath, bytes: buf.length },
         "whatsapp.gateway.media_url_fetched",
       );
-      return { path: tmpPath, cleanup: true };
+      return { path: tmpPath, cleanup: true, bytes: buf.length, source: "media_url" };
     } catch (err) {
+      if (payload.type === "audio") {
+        logVoiceTrace(logger, "whatsapp.voice.trace.error", payload, {
+          stage: "media_url_fetch_exception",
+          error: err?.message || String(err),
+          media_url: mediaUrl,
+        });
+      }
       logger.warn(
         { media_url: mediaUrl, err: err?.message },
         "whatsapp.gateway.media_url_fetch_error",
@@ -563,10 +594,25 @@ async function resolveMediaFile(payload) {
 
   const mediaPath = payload.media_path;
   if (mediaPath && fs.existsSync(mediaPath)) {
-    return { path: mediaPath, cleanup: false };
+    const bytes = fs.statSync(mediaPath).size;
+    if (payload.type === "audio") {
+      logVoiceTrace(logger, "whatsapp.voice.trace.downloaded", payload, {
+        downloaded_path: mediaPath,
+        file_size: bytes,
+        source: "media_path",
+      });
+    }
+    return { path: mediaPath, cleanup: false, bytes, source: "media_path" };
   }
 
   if (mediaPath) {
+    if (payload.type === "audio") {
+      logVoiceTrace(logger, "whatsapp.voice.trace.error", payload, {
+        stage: "media_path_missing",
+        error: "media_path not found on gateway host",
+        media_path: mediaPath,
+      });
+    }
     logger.warn({ media_path: mediaPath }, "whatsapp.gateway.media_path_missing");
   }
 
@@ -616,13 +662,24 @@ export async function sendMessage(payload) {
         }
       }
     } else if (type === "audio") {
+      logVoiceTrace(logger, "whatsapp.voice.trace.start", payload, {
+        stage: "gateway_send",
+        received_payload: sanitizePayloadForLog(payload),
+        jid,
+      });
+
       const media = await resolveMediaFile(payload);
       if (!media) {
+        logVoiceTrace(logger, "whatsapp.voice.trace.error", payload, {
+          stage: "resolve_media",
+          error: "Audio file not found on gateway host.",
+        });
         return {
           success: false,
           message: "Audio file not found on gateway host.",
         };
       }
+
       const fileName = payload.file_name || path.basename(media.path);
       const mimetype =
         payload.mimetype ||
@@ -632,6 +689,31 @@ export async function sendMessage(payload) {
         String(fileName).toLowerCase().endsWith(".webm");
       const usePtt =
         payload.ptt !== false && !isWebm && payload.ptt !== "0";
+
+      const fileInfo = voiceFileInfo(media.path, mimetype);
+      logVoiceTrace(logger, "whatsapp.voice.trace.file_info", payload, {
+        ...fileInfo,
+        media_source: media.source,
+        resolved_path: media.path,
+        is_webm: isWebm,
+        whatsapp_supported_ptt: usePtt,
+      });
+
+      logVoiceTrace(logger, "whatsapp.voice.trace.payload", payload, {
+        baileys_content: {
+          mimetype,
+          ptt: usePtt,
+          audio_bytes: fileInfo.file_size ?? 0,
+        },
+      });
+
+      logVoiceTrace(logger, "whatsapp.voice.trace.baileys_send", payload, {
+        jid,
+        ptt: usePtt,
+        file_size: fileInfo.file_size ?? 0,
+        send_message_called: true,
+      });
+
       logger.info(
         {
           clinic_id: clinicId,
@@ -657,6 +739,13 @@ export async function sendMessage(payload) {
           }
         }
       }
+
+      logVoiceTrace(logger, "whatsapp.voice.trace.baileys_result", payload, {
+        baileys_message_id: result?.key?.id ?? null,
+        baileys_key: result?.key ?? null,
+        baileys_status: result?.status ?? null,
+        send_message_succeeded: Boolean(result?.key?.id),
+      });
     } else if (type === "document") {
       const media = await resolveMediaFile(payload);
       if (!media) {
@@ -690,6 +779,13 @@ export async function sendMessage(payload) {
 
     const messageId = result?.key?.id || null;
     if (!messageId) {
+      if (type === "audio") {
+        logVoiceTrace(logger, "whatsapp.voice.trace.error", payload, {
+          stage: "baileys_no_message_id",
+          error: "WhatsApp did not return a message id",
+          baileys_result_keys: result ? Object.keys(result) : [],
+        });
+      }
       return {
         success: false,
         message:
@@ -702,6 +798,13 @@ export async function sendMessage(payload) {
       data: { message_id: messageId, status: "sent", jid },
     };
   } catch (err) {
+    if ((payload.type || "") === "audio") {
+      logVoiceTrace(logger, "whatsapp.voice.trace.error", payload, {
+        stage: "send_message_outer",
+        error: err?.message || String(err),
+        stack: err?.stack || null,
+      });
+    }
     return { success: false, message: err?.message || "Send failed" };
   }
 }

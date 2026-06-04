@@ -1,4 +1,6 @@
 import express from "express";
+import pino from "pino";
+import { logVoiceTrace } from "./voice-trace.js";
 import {
   disconnectSession,
   getSessionDiagnostics,
@@ -11,6 +13,7 @@ import {
 } from "./session-manager.js";
 
 const app = express();
+const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 const PORT = Number(process.env.PORT || 3100);
 const TOKEN = process.env.GATEWAY_TOKEN || "";
 
@@ -103,7 +106,17 @@ app.post("/internal/sessions/:clinicId/reset", async (req, res) => {
 });
 
 app.post("/internal/messages/send", async (req, res) => {
-  const result = await sendMessage(req.body || {});
+  const body = req.body || {};
+  if ((body.type || "") === "audio") {
+    logVoiceTrace(logger, "whatsapp.voice.trace.start", body, {
+      stage: "http_receive",
+      has_media_url: Boolean(body.media_url),
+      has_media_path: Boolean(body.media_path),
+      file_size: null,
+      ptt: body.ptt ?? null,
+    });
+  }
+  const result = await sendMessage(body);
   res.status(result.success ? 200 : 422).json(result);
 });
 
