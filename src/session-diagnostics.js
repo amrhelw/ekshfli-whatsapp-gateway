@@ -31,6 +31,10 @@ export function diagFor(clinicId) {
       pairing_in_progress: false,
       last_start_error: null,
       last_http_paths: [],
+      socket_created_at: null,
+      connection_reached_open_at: null,
+      connection_ever_open: false,
+      last_close_diagnostics: null,
     };
     diagnosticsByClinic.set(clinicId, d);
   }
@@ -70,11 +74,38 @@ function listAuthFiles(authDir) {
   return out;
 }
 
+/** @param {Record<string, unknown>|null} closeDiag */
+function buildBaileysDiagnosticsBlock(d, entry, closeDiag) {
+  const base = {
+    socket_created: Boolean(d.socket_created),
+    connection_update_received: Boolean(d.connection_update_received),
+    connection_update_count: d.connection_update_count || 0,
+    last_disconnect_reason: d.last_disconnect_reason,
+    last_disconnect_status_code: d.last_disconnect_status_code,
+    restart_required_detected: Boolean(d.restart_required_detected),
+    logged_out_detected: Boolean(d.logged_out_detected),
+    pairing_in_progress: entry.status === "connecting" && Boolean(entry.qr),
+    start_called_at: d.start_called_at,
+    last_start_error: d.last_start_error,
+    socket_created_at: d.socket_created_at ?? null,
+    first_qr_at: d.qr_generated_at ?? null,
+    connection_reached_open_at: d.connection_reached_open_at ?? null,
+    connection_ever_reached_open: Boolean(d.connection_ever_open),
+    last_close_at: closeDiag?.connection_close_at ?? null,
+  };
+  if (closeDiag && typeof closeDiag === "object") {
+    return { ...base, ...closeDiag };
+  }
+  return base;
+}
+
 export function buildGatewayDiagnostics(clinicId, entry, statusPayload) {
   const d = diagFor(clinicId);
   const authDir = entry.authDir;
   const authFiles = listAuthFiles(authDir);
   const hasCreds = authFiles.some((f) => f.endsWith("creds.json"));
+  const closeDiag = isObject(d.last_close_diagnostics) ? d.last_close_diagnostics : null;
+  const baileys = buildBaileysDiagnosticsBlock(d, entry, closeDiag);
 
   return {
     gateway_reachable: true,
@@ -98,21 +129,15 @@ export function buildGatewayDiagnostics(clinicId, entry, statusPayload) {
       qr_delivered_in_status_response: Boolean(statusPayload.qr),
       qr_prefix: statusPayload.qr ? String(statusPayload.qr).slice(0, 28) : null,
     },
-    baileys: {
-      socket_created: Boolean(d.socket_created),
-      connection_update_received: Boolean(d.connection_update_received),
-      connection_update_count: d.connection_update_count || 0,
-      last_disconnect_reason: d.last_disconnect_reason,
-      last_disconnect_status_code: d.last_disconnect_status_code,
-      restart_required_detected: Boolean(d.restart_required_detected),
-      logged_out_detected: Boolean(d.logged_out_detected),
-      pairing_in_progress: entry.status === "connecting" && Boolean(entry.qr),
-      start_called_at: d.start_called_at,
-      last_start_error: d.last_start_error,
-    },
+    baileys,
+    step_5_whatsapp_baileys_state: baileys,
     meta: {
       last_updated_at: d.last_updated_at,
       last_http_paths: d.last_http_paths || [],
     },
   };
+}
+
+function isObject(v) {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
 }

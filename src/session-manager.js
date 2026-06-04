@@ -9,6 +9,7 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   useMultiFileAuthState,
 } from "@whiskeysockets/baileys";
+import { buildCloseDiagnostics } from "./disconnect-diagnostics.js";
 import {
   buildGatewayDiagnostics,
   clearDiagnostics,
@@ -192,7 +193,10 @@ export async function startSession(
   });
 
   entry.sock = sock;
-  patchDiag(clinicId, { socket_created: true });
+  patchDiag(clinicId, {
+    socket_created: true,
+    socket_created_at: new Date().toISOString(),
+  });
 
   sock.ev.on("creds.update", saveCreds);
 
@@ -225,6 +229,10 @@ export async function startSession(
     }
 
     if (connection === "open") {
+      patchDiag(clinicId, {
+        connection_ever_open: true,
+        connection_reached_open_at: new Date().toISOString(),
+      });
       entry.status = "connected";
       entry.qr = null;
       entry.pairingCode = null;
@@ -237,11 +245,30 @@ export async function startSession(
     }
 
     if (connection === "close") {
+      const closeDiagnostics = buildCloseDiagnostics({
+        sock,
+        authDir: entry.authDir,
+        diagState: d,
+        lastDisconnect,
+      });
+      logger.info(
+        {
+          clinic_id: clinicId,
+          disconnect_reason_name: closeDiagnostics.disconnect_reason_name,
+          status_code: closeDiagnostics.last_disconnect_error_output_status_code,
+          is_boom: closeDiagnostics.error_is_boom,
+          logged_out: closeDiagnostics.disconnect_reason_name === "loggedOut",
+          close: closeDiagnostics,
+        },
+        "whatsapp.connection.close.diagnostics",
+      );
+
       const code = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = code !== DisconnectReason.loggedOut;
       entry.status = shouldReconnect ? "reconnecting" : "disconnected";
       entry.lastError = lastDisconnect?.error?.message || "Connection closed";
       patchDiag(clinicId, {
+        last_close_diagnostics: closeDiagnostics,
         last_disconnect_reason: entry.lastError,
         last_disconnect_status_code: code ?? null,
         restart_required_detected:
