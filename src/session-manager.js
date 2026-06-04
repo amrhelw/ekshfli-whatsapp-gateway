@@ -28,6 +28,7 @@ import {
   sanitizePayloadForLog,
   voiceFileInfo,
 } from "./voice-trace.js";
+import { prepareVoiceNoteAudio } from "./voice-transcode.js";
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
@@ -681,37 +682,45 @@ export async function sendMessage(payload) {
       }
 
       const fileName = payload.file_name || path.basename(media.path);
-      const mimetype =
+      const originalMimetype =
         payload.mimetype ||
         mimeFromFileName(fileName, "audio/ogg; codecs=opus");
-      const isWebm =
-        String(mimetype).toLowerCase().includes("webm") ||
-        String(fileName).toLowerCase().endsWith(".webm");
-      const usePtt =
-        payload.ptt !== false && !isWebm && payload.ptt !== "0";
 
-      const fileInfo = voiceFileInfo(media.path, mimetype);
+      const fileInfo = voiceFileInfo(media.path, originalMimetype);
       logVoiceTrace(logger, "whatsapp.voice.trace.file_info", payload, {
         ...fileInfo,
         media_source: media.source,
         resolved_path: media.path,
-        is_webm: isWebm,
-        whatsapp_supported_ptt: usePtt,
       });
 
+      const voicePrep = await prepareVoiceNoteAudio(
+        logger,
+        payload,
+        media.path,
+        originalMimetype,
+        fileName,
+      );
+
+      const sendPath = voicePrep.sendPath;
+      const sendMimetype = voicePrep.mimetype;
+      const sendPtt = voicePrep.ptt;
+      const sendFileInfo = voiceFileInfo(sendPath, sendMimetype);
+
       logVoiceTrace(logger, "whatsapp.voice.trace.payload", payload, {
+        ...voicePrep.diagnostics,
         baileys_content: {
-          mimetype,
-          ptt: usePtt,
-          audio_bytes: fileInfo.file_size ?? 0,
+          mimetype: sendMimetype,
+          ptt: sendPtt,
+          audio_bytes: sendFileInfo.file_size ?? 0,
         },
       });
 
       logVoiceTrace(logger, "whatsapp.voice.trace.baileys_send", payload, {
         jid,
-        ptt: usePtt,
-        file_size: fileInfo.file_size ?? 0,
+        ptt: sendPtt,
+        file_size: sendFileInfo.file_size ?? 0,
         send_message_called: true,
+        ...voicePrep.diagnostics,
       });
 
       logger.info(
@@ -719,21 +728,29 @@ export async function sendMessage(payload) {
           clinic_id: clinicId,
           to: payload.to,
           file_name: fileName,
-          mimetype,
-          ptt: usePtt,
+          mimetype: sendMimetype,
+          ptt: sendPtt,
+          transcoding_success: voicePrep.diagnostics.transcoding_success,
         },
         "whatsapp.audio.send.start",
       );
       try {
         result = await entry.sock.sendMessage(jid, {
-          audio: fs.readFileSync(media.path),
-          mimetype,
-          ptt: usePtt,
+          audio: fs.readFileSync(sendPath),
+          mimetype: sendMimetype,
+          ptt: sendPtt,
         });
       } finally {
+        const pathsToCleanup = new Set();
         if (media.cleanup) {
+          pathsToCleanup.add(media.path);
+        }
+        if (voicePrep.cleanupOutput && sendPath !== media.path) {
+          pathsToCleanup.add(sendPath);
+        }
+        for (const p of pathsToCleanup) {
           try {
-            fs.unlinkSync(media.path);
+            fs.unlinkSync(p);
           } catch {
             /* ignore */
           }
@@ -745,6 +762,8 @@ export async function sendMessage(payload) {
         baileys_key: result?.key ?? null,
         baileys_status: result?.status ?? null,
         send_message_succeeded: Boolean(result?.key?.id),
+        final_ptt: sendPtt,
+        ...voicePrep.diagnostics,
       });
     } else if (type === "document") {
       const media = await resolveMediaFile(payload);
