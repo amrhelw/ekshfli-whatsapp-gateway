@@ -9,6 +9,12 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   useMultiFileAuthState,
 } from "@whiskeysockets/baileys";
+import {
+  buildGatewayDiagnostics,
+  diagFor,
+  noteDiagPath,
+  patchDiag,
+} from "./session-diagnostics.js";
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
@@ -41,6 +47,34 @@ function authDirFor(clinicId) {
   return path.join(sessionsRoot(), String(clinicId));
 }
 
+function qrTraceLength(qr) {
+  return qr ? String(qr).length : 0;
+}
+
+function waitForQr(entry, timeoutMs = 20000) {
+  const waitMs = Number(process.env.QR_WAIT_MS || timeoutMs);
+  return new Promise((resolve) => {
+    if (entry.qr) return resolve(entry.qr);
+    const deadline = Date.now() + waitMs;
+    const timer = setInterval(() => {
+      if (entry.qr) {
+        clearInterval(timer);
+        resolve(entry.qr);
+        return;
+      }
+      if (entry.status === "connected") {
+        clearInterval(timer);
+        resolve(null);
+        return;
+      }
+      if (Date.now() >= deadline) {
+        clearInterval(timer);
+        resolve(null);
+      }
+    }, 250);
+  });
+}
+
 function entryFor(clinicId) {
   let entry = sessions.get(clinicId);
   if (!entry) {
@@ -64,7 +98,7 @@ function entryFor(clinicId) {
 /** Read-only session snapshot for status polling — no side effects. */
 export function getSessionStatus(clinicId) {
   const entry = entryFor(clinicId);
-  return {
+  const payload = {
     clinic_id: clinicId,
     status: entry.status,
     qr: entry.qr,
@@ -75,6 +109,24 @@ export function getSessionStatus(clinicId) {
     last_error: entry.lastError,
     session_id: String(clinicId),
   };
+  logger.info(
+    {
+      clinic_id: clinicId,
+      status: payload.status,
+      qr_length: qrTraceLength(payload.qr),
+      qr_prefix: payload.qr ? String(payload.qr).slice(0, 30) : null,
+    },
+    "whatsapp.qr.trace.gateway_status_response",
+  );
+  return payload;
+}
+
+/** Structured gateway snapshot for WhatsApp connection diagnostics (no log dump). */
+export function getSessionDiagnostics(clinicId) {
+  const entry = entryFor(clinicId);
+  const statusPayload = getSessionStatus(clinicId);
+  noteDiagPath(clinicId, "GET /internal/sessions/:id/diagnostics");
+  return buildGatewayDiagnostics(clinicId, entry, statusPayload);
 }
 
 export async function restoreAllSessions() {
@@ -101,7 +153,19 @@ export async function startSession(
   isRestore = false,
 ) {
   const entry = entryFor(clinicId);
+  noteDiagPath(clinicId, "POST /internal/sessions/:id/start", {
+    method,
+    is_restore: isRestore,
+  });
+  patchDiag(clinicId, {
+    start_called_at: new Date().toISOString(),
+    socket_created: false,
+    qr_generated: false,
+    connection_update_received: false,
+    last_start_error: null,
+  });
   entry.status = "connecting";
+  patchDiag(clinicId, { status: "connecting" });
   entry.qr = null;
   entry.pairingCode = null;
   entry.lastError = null;
@@ -127,11 +191,15 @@ export async function startSession(
   });
 
   entry.sock = sock;
+  patchDiag(clinicId, { socket_created: true });
 
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
+    const d = diagFor(clinicId);
+    d.connection_update_count = (d.connection_update_count || 0) + 1;
+    patchDiag(clinicId, { connection_update_received: true });
 
     if (qr) {
       try {
@@ -140,6 +208,19 @@ export async function startSession(
         entry.qr = qr;
       }
       entry.status = "connecting";
+      patchDiag(clinicId, {
+        qr_generated: true,
+        qr_generated_at: new Date().toISOString(),
+        status: "connecting",
+      });
+      logger.info(
+        {
+          clinic_id: clinicId,
+          qr_length: qrTraceLength(entry.qr),
+          qr_prefix: entry.qr ? String(entry.qr).slice(0, 30) : null,
+        },
+        "whatsapp.qr.trace.gateway_generated",
+      );
     }
 
     if (connection === "open") {
@@ -159,6 +240,15 @@ export async function startSession(
       const shouldReconnect = code !== DisconnectReason.loggedOut;
       entry.status = shouldReconnect ? "reconnecting" : "disconnected";
       entry.lastError = lastDisconnect?.error?.message || "Connection closed";
+      patchDiag(clinicId, {
+        last_disconnect_reason: entry.lastError,
+        last_disconnect_status_code: code ?? null,
+        restart_required_detected:
+          code === DisconnectReason.restartRequired || code === 515,
+        logged_out_detected:
+          code === DisconnectReason.loggedOut || code === 401,
+        status: entry.status,
+      });
 
       if (shouldReconnect && !isRestore) {
         setTimeout(() => startSession(clinicId, method, phone, true), 3000);
@@ -176,10 +266,31 @@ export async function startSession(
     } catch (err) {
       entry.lastError = err?.message || "Pairing code failed";
       entry.status = "disconnected";
+      patchDiag(clinicId, {
+        last_start_error: entry.lastError,
+        status: "disconnected",
+      });
     }
   }
 
-  return getSessionStatus(clinicId);
+  if (method === "qr") {
+    await waitForQr(entry);
+  }
+
+  const out = getSessionStatus(clinicId);
+  if (out.qr) {
+    patchDiag(clinicId, { qr_delivered_in_start_response: true });
+  }
+  logger.info(
+    {
+      clinic_id: clinicId,
+      method,
+      is_restore: isRestore,
+      qr_length: qrTraceLength(out.qr),
+    },
+    "whatsapp.qr.trace.gateway_start_response",
+  );
+  return out;
 }
 
 export async function reconnectSession(clinicId) {

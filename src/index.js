@@ -1,6 +1,7 @@
 import express from "express";
 import {
   disconnectSession,
+  getSessionDiagnostics,
   getSessionStatus,
   reconnectSession,
   resetSession,
@@ -49,6 +50,11 @@ app.post("/internal/sessions/:clinicId/start", async (req, res) => {
 app.get("/internal/sessions/:clinicId/status", (req, res) => {
   const clinicId = Number(req.params.clinicId);
   res.json({ success: true, data: getSessionStatus(clinicId) });
+});
+
+app.get("/internal/sessions/:clinicId/diagnostics", (req, res) => {
+  const clinicId = Number(req.params.clinicId);
+  res.json({ success: true, data: getSessionDiagnostics(clinicId) });
 });
 
 app.post("/internal/sessions/:clinicId/reconnect", async (req, res) => {
