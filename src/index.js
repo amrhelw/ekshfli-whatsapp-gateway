@@ -40,7 +40,13 @@ app.post("/internal/sessions/:clinicId/start", async (req, res) => {
   const method = req.body?.method === "pairing" ? "pairing" : "qr";
   const phone = req.body?.phone || null;
   try {
-    const data = await startSession(clinicId, method, phone);
+    const data = await startSession(
+      clinicId,
+      method,
+      phone,
+      false,
+      `HTTP:POST /internal/sessions/${clinicId}/start`,
+    );
     res.json({ success: true, data });
   } catch (err) {
     res.status(500).json({ success: false, message: err?.message || "Start failed" });
@@ -60,7 +66,10 @@ app.get("/internal/sessions/:clinicId/diagnostics", (req, res) => {
 app.post("/internal/sessions/:clinicId/reconnect", async (req, res) => {
   const clinicId = Number(req.params.clinicId);
   try {
-    const data = await reconnectSession(clinicId);
+    const data = await reconnectSession(
+      clinicId,
+      `HTTP:POST /internal/sessions/${clinicId}/reconnect`,
+    );
     res.json({ success: true, data });
   } catch (err) {
     res.status(500).json({ success: false, message: err?.message || "Reconnect failed" });
@@ -70,7 +79,10 @@ app.post("/internal/sessions/:clinicId/reconnect", async (req, res) => {
 app.post("/internal/sessions/:clinicId/disconnect", async (req, res) => {
   const clinicId = Number(req.params.clinicId);
   try {
-    const data = await disconnectSession(clinicId);
+    const data = await disconnectSession(
+      clinicId,
+      `HTTP:POST /internal/sessions/${clinicId}/disconnect`,
+    );
     res.json({ success: true, data });
   } catch (err) {
     res.status(500).json({ success: false, message: err?.message || "Disconnect failed" });
@@ -80,7 +92,10 @@ app.post("/internal/sessions/:clinicId/disconnect", async (req, res) => {
 app.post("/internal/sessions/:clinicId/reset", async (req, res) => {
   const clinicId = Number(req.params.clinicId);
   try {
-    const result = await resetSession(clinicId);
+    const result = await resetSession(
+      clinicId,
+      `HTTP:POST /internal/sessions/${clinicId}/reset`,
+    );
     res.status(result.success ? 200 : 422).json(result);
   } catch (err) {
     res.status(500).json({ success: false, message: err?.message || "Reset failed" });

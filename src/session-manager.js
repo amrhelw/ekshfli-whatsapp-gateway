@@ -17,6 +17,12 @@ import {
   noteDiagPath,
   patchDiag,
 } from "./session-diagnostics.js";
+import {
+  nextSocketGenerationId,
+  traceLogout,
+  traceSessionCleanup,
+  traceSocketDestroy,
+} from "./session-trace.js";
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
@@ -35,6 +41,7 @@ const sessions = new Map();
  * @property {string|null} lastError
  * @property {import('@whiskeysockets/baileys').WASocket|null} sock
  * @property {string} authDir
+ * @property {number} socketGenerationId
  */
 
 function sessionsRoot() {
@@ -91,6 +98,7 @@ function entryFor(clinicId) {
       lastError: null,
       sock: null,
       authDir: authDirFor(clinicId),
+      socketGenerationId: 0,
     };
     sessions.set(clinicId, entry);
   }
@@ -143,7 +151,7 @@ export async function restoreAllSessions() {
     if (!Number.isFinite(clinicId)) continue;
     const creds = path.join(root, dir.name, "creds.json");
     if (fs.existsSync(creds)) {
-      await startSession(clinicId, "qr", null, true);
+      await startSession(clinicId, "qr", null, true, "restoreAllSessions");
     }
   }
 }
@@ -153,11 +161,13 @@ export async function startSession(
   method = "qr",
   phone = null,
   isRestore = false,
+  caller = "startSession",
 ) {
   const entry = entryFor(clinicId);
   noteDiagPath(clinicId, "POST /internal/sessions/:id/start", {
     method,
     is_restore: isRestore,
+    caller,
   });
   patchDiag(clinicId, {
     start_called_at: new Date().toISOString(),
@@ -173,6 +183,12 @@ export async function startSession(
   entry.lastError = null;
 
   if (entry.sock) {
+    traceSocketDestroy(logger, {
+      clinicId,
+      caller: `${caller}:replace_existing_socket`,
+      entry,
+      extra: { method: "sock.end", is_restore: isRestore },
+    });
     try {
       entry.sock.end(undefined);
     } catch {
@@ -184,6 +200,7 @@ export async function startSession(
   const { state, saveCreds } = await useMultiFileAuthState(entry.authDir);
   const { version } = await fetchLatestBaileysVersion();
 
+  const socketGenerationId = nextSocketGenerationId(entry);
   const sock = makeWASocket({
     version,
     auth: state,
@@ -196,6 +213,7 @@ export async function startSession(
   patchDiag(clinicId, {
     socket_created: true,
     socket_created_at: new Date().toISOString(),
+    socket_generation_id: socketGenerationId,
   });
 
   sock.ev.on("creds.update", saveCreds);
@@ -251,13 +269,20 @@ export async function startSession(
         diagState: d,
         lastDisconnect,
       });
+      const intentionalLogout =
+        closeDiagnostics.disconnect_reason_name === "loggedOut" ||
+        closeDiagnostics.last_disconnect_error_message === "Intentional Logout";
       logger.info(
         {
           clinic_id: clinicId,
+          socket_generation_id: entry.socketGenerationId,
           disconnect_reason_name: closeDiagnostics.disconnect_reason_name,
           status_code: closeDiagnostics.last_disconnect_error_output_status_code,
           is_boom: closeDiagnostics.error_is_boom,
           logged_out: closeDiagnostics.disconnect_reason_name === "loggedOut",
+          intentional_logout: intentionalLogout,
+          last_disconnect_error_message:
+            closeDiagnostics.last_disconnect_error_message,
           close: closeDiagnostics,
         },
         "whatsapp.connection.close.diagnostics",
@@ -279,7 +304,17 @@ export async function startSession(
       });
 
       if (shouldReconnect && !isRestore) {
-        setTimeout(() => startSession(clinicId, method, phone, true), 3000);
+        setTimeout(
+          () =>
+            startSession(
+              clinicId,
+              method,
+              phone,
+              true,
+              "connection.update:scheduled_reconnect",
+            ),
+          3000,
+        );
       }
     }
   });
@@ -321,22 +356,43 @@ export async function startSession(
   return out;
 }
 
-export async function reconnectSession(clinicId) {
-  return startSession(clinicId, "qr", null, true);
+export async function reconnectSession(clinicId, caller = "reconnectSession") {
+  return startSession(clinicId, "qr", null, true, caller);
 }
 
-export async function disconnectSession(clinicId) {
+export async function disconnectSession(clinicId, caller = "disconnectSession") {
   const entry = entryFor(clinicId);
   if (entry.sock) {
+    traceLogout(logger, {
+      clinicId,
+      caller,
+      entry,
+      extra: { method: "sock.logout" },
+    });
     try {
       await entry.sock.logout();
-    } catch {
+    } catch (err) {
+      traceSocketDestroy(logger, {
+        clinicId,
+        caller: `${caller}:logout_failed_fallback_end`,
+        entry,
+        extra: {
+          method: "sock.end",
+          logout_error: err?.message || String(err),
+        },
+      });
       try {
         entry.sock.end(undefined);
       } catch {
         /* ignore */
       }
     }
+    traceSocketDestroy(logger, {
+      clinicId,
+      caller: `${caller}:after_logout_clear_sock`,
+      entry,
+      extra: { method: "entry.sock=null" },
+    });
     entry.sock = null;
   }
 
@@ -349,6 +405,15 @@ export async function disconnectSession(clinicId) {
   entry.lastError = null;
 
   if (fs.existsSync(entry.authDir)) {
+    traceSessionCleanup(logger, {
+      clinicId,
+      caller,
+      entry,
+      extra: {
+        action: "auth_directory_removed",
+        auth_dir: entry.authDir,
+      },
+    });
     fs.rmSync(entry.authDir, { recursive: true, force: true });
   }
 
@@ -387,11 +452,11 @@ function buildResetVerification(clinicId, entry) {
 }
 
 /** Admin reset — same as disconnect (clears auth); does not auto-start QR. */
-export async function resetSession(clinicId) {
-  logger.info({ clinic_id: clinicId }, "whatsapp.session.reset");
-  noteDiagPath(clinicId, `POST /internal/sessions/${clinicId}/reset`);
+export async function resetSession(clinicId, caller = "resetSession") {
+  logger.info({ clinic_id: clinicId, caller }, "whatsapp.session.reset");
+  noteDiagPath(clinicId, `POST /internal/sessions/${clinicId}/reset`, { caller });
   try {
-    const data = await disconnectSession(clinicId);
+    const data = await disconnectSession(clinicId, `${caller}->disconnectSession`);
     const entry = entryFor(clinicId);
     clearDiagnostics(clinicId);
     patchDiag(clinicId, {
