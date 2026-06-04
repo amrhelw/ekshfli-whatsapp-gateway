@@ -46,6 +46,10 @@ export function patchDiag(clinicId, patch) {
   }
 }
 
+export function clearDiagnostics(clinicId) {
+  diagnosticsByClinic.delete(clinicId);
+}
+
 export function noteDiagPath(clinicId, path, meta = {}) {
   const d = diagFor(clinicId);
   const row = { path, at: iso(), ...meta };

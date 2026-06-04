@@ -11,6 +11,7 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import {
   buildGatewayDiagnostics,
+  clearDiagnostics,
   diagFor,
   noteDiagPath,
   patchDiag,
@@ -315,6 +316,10 @@ export async function disconnectSession(clinicId) {
   entry.status = "disconnected";
   entry.qr = null;
   entry.pairingCode = null;
+  entry.phoneNumber = null;
+  entry.waJid = null;
+  entry.profileName = null;
+  entry.lastError = null;
 
   if (fs.existsSync(entry.authDir)) {
     fs.rmSync(entry.authDir, { recursive: true, force: true });
@@ -323,21 +328,69 @@ export async function disconnectSession(clinicId) {
   return getSessionStatus(clinicId);
 }
 
+function buildResetVerification(clinicId, entry) {
+  const authDir = entry.authDir;
+  const authExists = fs.existsSync(authDir);
+  let hasCreds = false;
+  if (authExists) {
+    try {
+      hasCreds = fs.existsSync(path.join(authDir, "creds.json"));
+    } catch {
+      hasCreds = false;
+    }
+  }
+  const fullyCleared =
+    !authExists &&
+    !hasCreds &&
+    !entry.sock &&
+    !entry.qr &&
+    entry.status === "disconnected";
+
+  return {
+    clinic_id: clinicId,
+    gateway_endpoint: `POST /internal/sessions/${clinicId}/reset`,
+    auth_directory: authDir,
+    auth_directory_exists: authExists,
+    has_creds_json: hasCreds,
+    has_socket: Boolean(entry.sock),
+    qr_in_memory: Boolean(entry.qr),
+    session_status: entry.status,
+    fully_cleared: fullyCleared,
+  };
+}
+
 /** Admin reset — same as disconnect (clears auth); does not auto-start QR. */
 export async function resetSession(clinicId) {
   logger.info({ clinic_id: clinicId }, "whatsapp.session.reset");
+  noteDiagPath(clinicId, `POST /internal/sessions/${clinicId}/reset`);
   try {
     const data = await disconnectSession(clinicId);
-    return { success: true, data };
+    const entry = entryFor(clinicId);
+    clearDiagnostics(clinicId);
+    patchDiag(clinicId, {
+      status: "disconnected",
+      qr_generated: false,
+      socket_created: false,
+      connection_update_received: false,
+      last_reset_at: new Date().toISOString(),
+    });
+    const verification = buildResetVerification(clinicId, entry);
+    logger.info(
+      { clinic_id: clinicId, verification },
+      "whatsapp.session.reset.verification",
+    );
+    return { success: verification.fully_cleared, data, verification };
   } catch (err) {
     logger.warn(
       { clinic_id: clinicId, err: err?.message },
       "whatsapp.session.reset.failed",
     );
+    const entry = entryFor(clinicId);
     return {
       success: false,
       message: err?.message || "Session reset failed",
       data: getSessionStatus(clinicId),
+      verification: buildResetVerification(clinicId, entry),
     };
   }
 }
