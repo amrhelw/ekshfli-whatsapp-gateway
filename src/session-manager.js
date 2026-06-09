@@ -583,15 +583,18 @@ function mimeFromFileName(fileName, fallback = "application/octet-stream") {
 }
 
 /**
- * Resolve media from gateway-local path or download from media_url (API-hosted fetch).
- * @returns {Promise<{ path: string, cleanup: boolean }|null>}
- */
-/**
  * @param {Record<string, unknown>} payload
- * @returns {Promise<{ path: string, cleanup: boolean, bytes: number, source: string }|null>}
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   media?: { path: string, cleanup: boolean, bytes: number, source: string },
+ *   failure?: { stage: string, message: string, media_url?: string|null, media_path?: string|null, http_status?: number|null }
+ * }>}
  */
 async function resolveMediaFile(payload) {
-  const mediaUrl = payload.media_url;
+  const mediaUrl = payload.media_url ? String(payload.media_url) : "";
+  const mediaPath = payload.media_path ? String(payload.media_path) : "";
+  let urlFailure = null;
+
   if (mediaUrl) {
     const headers = {};
     const token = process.env.GATEWAY_TOKEN || "";
@@ -605,21 +608,24 @@ async function resolveMediaFile(payload) {
       headers["x-api-key"] = String(payload.media_fetch_x_api_key);
     }
     try {
-      const res = await fetch(String(mediaUrl), { headers });
+      logger.info(
+        { media_url: mediaUrl, media_path: mediaPath || null, type: payload.type },
+        "whatsapp.gateway.media_resolve.start",
+      );
+      const res = await fetch(mediaUrl, { headers });
       if (!res.ok) {
+        urlFailure = {
+          stage: "media_url_fetch",
+          message: `Gateway could not download media (HTTP ${res.status}).`,
+          media_url: mediaUrl,
+          media_path: mediaPath || null,
+          http_status: res.status,
+        };
         if (payload.type === "audio") {
-          logVoiceTrace(logger, "whatsapp.voice.trace.error", payload, {
-            stage: "media_url_fetch",
-            error: `HTTP ${res.status}`,
-            media_url: mediaUrl,
-          });
+          logVoiceTrace(logger, "whatsapp.voice.trace.error", payload, urlFailure);
         }
-        logger.warn(
-          { media_url: mediaUrl, status: res.status },
-          "whatsapp.gateway.media_url_fetch_failed",
-        );
-        return null;
-      }
+        logger.warn(urlFailure, "whatsapp.gateway.media_url_fetch_failed");
+      } else {
       const buf = Buffer.from(await res.arrayBuffer());
       const defaultExt = payload.type === "audio" ? ".webm" : ".pdf";
       const ext =
@@ -641,24 +647,31 @@ async function resolveMediaFile(payload) {
         { media_url: mediaUrl, tmp_path: tmpPath, bytes: buf.length },
         "whatsapp.gateway.media_url_fetched",
       );
-      return { path: tmpPath, cleanup: true, bytes: buf.length, source: "media_url" };
-    } catch (err) {
-      if (payload.type === "audio") {
-        logVoiceTrace(logger, "whatsapp.voice.trace.error", payload, {
-          stage: "media_url_fetch_exception",
-          error: err?.message || String(err),
-          media_url: mediaUrl,
-        });
+      return {
+        ok: true,
+        media: {
+          path: tmpPath,
+          cleanup: true,
+          bytes: buf.length,
+          source: "media_url",
+        },
+      };
       }
-      logger.warn(
-        { media_url: mediaUrl, err: err?.message },
-        "whatsapp.gateway.media_url_fetch_error",
-      );
-      return null;
+    } catch (err) {
+      urlFailure = {
+        stage: "media_url_fetch_exception",
+        message: `Gateway media download failed: ${err?.message || String(err)}`,
+        media_url: mediaUrl,
+        media_path: mediaPath || null,
+        http_status: null,
+      };
+      if (payload.type === "audio") {
+        logVoiceTrace(logger, "whatsapp.voice.trace.error", payload, urlFailure);
+      }
+      logger.warn(urlFailure, "whatsapp.gateway.media_url_fetch_error");
     }
   }
 
-  const mediaPath = payload.media_path;
   if (mediaPath && fs.existsSync(mediaPath)) {
     const bytes = fs.statSync(mediaPath).size;
     if (payload.type === "audio") {
@@ -668,21 +681,58 @@ async function resolveMediaFile(payload) {
         source: "media_path",
       });
     }
-    return { path: mediaPath, cleanup: false, bytes, source: "media_path" };
+    logger.info(
+      { media_path: mediaPath, bytes, source: "media_path" },
+      "whatsapp.gateway.media_path_resolved",
+    );
+    return {
+      ok: true,
+      media: { path: mediaPath, cleanup: false, bytes, source: "media_path" },
+    };
   }
 
   if (mediaPath) {
+    const pathFailure = {
+      stage: "media_path_missing",
+      message:
+        "Audio file not found on gateway host. The API sent a local path that is not visible to the gateway process.",
+      media_url: mediaUrl || null,
+      media_path: mediaPath,
+      http_status: null,
+    };
     if (payload.type === "audio") {
-      logVoiceTrace(logger, "whatsapp.voice.trace.error", payload, {
-        stage: "media_path_missing",
-        error: "media_path not found on gateway host",
-        media_path: mediaPath,
-      });
+      logVoiceTrace(logger, "whatsapp.voice.trace.error", payload, pathFailure);
     }
-    logger.warn({ media_path: mediaPath }, "whatsapp.gateway.media_path_missing");
+    logger.warn(pathFailure, "whatsapp.gateway.media_path_missing");
+    return { ok: false, failure: pathFailure };
   }
 
-  return null;
+  if (urlFailure) {
+    return { ok: false, failure: urlFailure };
+  }
+
+  return {
+    ok: false,
+    failure: {
+      stage: "media_missing",
+      message: "No media_url or media_path provided to gateway.",
+      media_url: null,
+      media_path: null,
+      http_status: null,
+    },
+  };
+}
+
+function resolveMediaFailureMessage(payload, failure) {
+  if (!failure) {
+    return payload.type === "audio"
+      ? "Audio file not found on gateway host."
+      : "Media file not found on gateway host.";
+  }
+  if (failure.stage === "media_path_missing" && payload.type === "audio") {
+    return "Audio file not found on gateway host.";
+  }
+  return failure.message || "Media file not found on gateway host.";
 }
 
 export async function sendMessage(payload) {
@@ -706,11 +756,12 @@ export async function sendMessage(payload) {
         text: String(payload.text || ""),
       });
     } else if (type === "image") {
-      const media = await resolveMediaFile(payload);
-      if (!media) {
+      const resolved = await resolveMediaFile(payload);
+      const media = resolved.media;
+      if (!resolved.ok || !media) {
         return {
           success: false,
-          message: "Image file not found on gateway host.",
+          message: resolveMediaFailureMessage(payload, resolved.failure),
         };
       }
       try {
@@ -734,15 +785,28 @@ export async function sendMessage(payload) {
         jid,
       });
 
-      const media = await resolveMediaFile(payload);
-      if (!media) {
+      const resolved = await resolveMediaFile(payload);
+      const media = resolved.media;
+      if (!resolved.ok || !media) {
+        const failMessage = resolveMediaFailureMessage(payload, resolved.failure);
         logVoiceTrace(logger, "whatsapp.voice.trace.error", payload, {
           stage: "resolve_media",
-          error: "Audio file not found on gateway host.",
+          error: failMessage,
+          ...(resolved.failure || {}),
         });
+        logger.warn(
+          {
+            clinic_id: clinicId,
+            failure_stage: resolved.failure?.stage ?? null,
+            media_url: resolved.failure?.media_url ?? payload.media_url ?? null,
+            media_path: resolved.failure?.media_path ?? payload.media_path ?? null,
+            http_status: resolved.failure?.http_status ?? null,
+          },
+          "whatsapp.voice.resolve_media_failed",
+        );
         return {
           success: false,
-          message: "Audio file not found on gateway host.",
+          message: failMessage,
         };
       }
 
@@ -831,11 +895,12 @@ export async function sendMessage(payload) {
         ...voicePrep.diagnostics,
       });
     } else if (type === "document") {
-      const media = await resolveMediaFile(payload);
-      if (!media) {
+      const resolved = await resolveMediaFile(payload);
+      const media = resolved.media;
+      if (!resolved.ok || !media) {
         return {
           success: false,
-          message: "Document file not found on gateway host.",
+          message: resolveMediaFailureMessage(payload, resolved.failure),
         };
       }
       const fileName = payload.file_name || path.basename(media.path);
