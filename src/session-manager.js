@@ -111,6 +111,72 @@ function entryFor(clinicId) {
   return entry;
 }
 
+function clearReconnectTimer(entry) {
+  if (entry._reconnectTimer) {
+    clearTimeout(entry._reconnectTimer);
+    entry._reconnectTimer = null;
+  }
+}
+
+function scheduleSessionReconnect(
+  clinicId,
+  entry,
+  { method, phone, code, disconnectMessage },
+) {
+  clearReconnectTimer(entry);
+
+  const isRestartRequired =
+    code === DisconnectReason.restartRequired ||
+    code === 515 ||
+    /restart required/i.test(String(disconnectMessage || ""));
+
+  if (isRestartRequired) {
+    entry.lastError = null;
+  }
+
+  const delay = isRestartRequired ? 600 : 3000;
+
+  logger.info(
+    {
+      clinic_id: clinicId,
+      disconnect_code: code ?? null,
+      is_restart_required: isRestartRequired,
+      delay_ms: delay,
+      socket_generation_id: entry.socketGenerationId,
+    },
+    "whatsapp.connection.reconnect.scheduled",
+  );
+
+  patchDiag(clinicId, {
+    reconnect_scheduled: true,
+    reconnect_scheduled_at: new Date().toISOString(),
+    reconnect_delay_ms: delay,
+    restart_required_auto_recovery: isRestartRequired,
+  });
+
+  entry._reconnectTimer = setTimeout(() => {
+    entry._reconnectTimer = null;
+    startSession(
+      clinicId,
+      method,
+      phone,
+      true,
+      "connection.update:scheduled_reconnect",
+    ).catch((err) => {
+      logger.error(
+        { clinic_id: clinicId, err: err?.message || String(err) },
+        "whatsapp.connection.reconnect.failed",
+      );
+      entry.lastError = err?.message || "Reconnect failed";
+      entry.status = "disconnected";
+      patchDiag(clinicId, {
+        last_start_error: entry.lastError,
+        status: "disconnected",
+      });
+    });
+  }, delay);
+}
+
 /** Read-only session snapshot for status polling — no side effects. */
 export function getSessionStatus(clinicId) {
   const entry = entryFor(clinicId);
@@ -170,6 +236,7 @@ export async function startSession(
   caller = "startSession",
 ) {
   const entry = entryFor(clinicId);
+  clearReconnectTimer(entry);
   noteDiagPath(clinicId, "POST /internal/sessions/:id/start", {
     method,
     is_restore: isRestore,
@@ -309,18 +376,15 @@ export async function startSession(
         status: entry.status,
       });
 
-      if (shouldReconnect && !isRestore) {
-        setTimeout(
-          () =>
-            startSession(
-              clinicId,
-              method,
-              phone,
-              true,
-              "connection.update:scheduled_reconnect",
-            ),
-          3000,
-        );
+      if (shouldReconnect) {
+        scheduleSessionReconnect(clinicId, entry, {
+          method,
+          phone,
+          code,
+          disconnectMessage: entry.lastError,
+        });
+      } else {
+        clearReconnectTimer(entry);
       }
     }
   });
@@ -368,6 +432,7 @@ export async function reconnectSession(clinicId, caller = "reconnectSession") {
 
 export async function disconnectSession(clinicId, caller = "disconnectSession") {
   const entry = entryFor(clinicId);
+  clearReconnectTimer(entry);
   if (entry.sock) {
     traceLogout(logger, {
       clinicId,
