@@ -21,9 +21,13 @@ const TOKEN = process.env.GATEWAY_TOKEN || "";
 app.use(express.json({ limit: "25mb" }));
 
 app.use((req, res, next) => {
+  // Runtime audit: /health must stay readable without token so inbound telemetry is probeable.
+  if (req.method === "GET" && (req.path === "/health" || req.url?.startsWith("/health"))) {
+    return next();
+  }
   console.log({
-    expected: process.env.GATEWAY_TOKEN,
-    received: req.headers["x-gateway-token"],
+    expected: process.env.GATEWAY_TOKEN ? "[set]" : undefined,
+    received: req.headers["x-gateway-token"] ? "[set]" : undefined,
   });
   if (!TOKEN) {
     return next();

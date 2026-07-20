@@ -15,6 +15,18 @@ let lastInboundPostAt = null;
 let lastInboundPostStatus = null;
 let lastInboundPostError = null;
 
+/** Runtime telemetry for /health — filled only by live socket activity. */
+let lastAttachAt = null;
+let lastAttachClinicId = null;
+let lastListenerCounts = null;
+let lastEventNamesAtAttach = null;
+let lastUpsertListenerCount = null;
+let sockEvEventsObserved = 0;
+let messagesUpsertObserved = 0;
+/** @type {Array<{at:string,event:string,summary:string}>} */
+const recentSockEvEvents = [];
+const RECENT_EV_MAX = 80;
+
 function inboundLog(step, fields = {}) {
   const payload = { tag: "[INBOUND]", step, ...fields };
   // Dual sink: pino (Railway) + console (always visible in Railway deploy logs)
@@ -58,11 +70,123 @@ export function getInboundWebhookConfig() {
     token_configured: tokenSource !== "none",
     token_source: tokenSource,
     listeners_attach_count: inboundAttachCount,
+    last_attach_at: lastAttachAt,
+    last_attach_clinic_id: lastAttachClinicId,
+    last_listener_counts: lastListenerCounts,
+    last_event_names_at_attach: lastEventNamesAtAttach,
+    last_upsert_listener_count: lastUpsertListenerCount,
+    sock_ev_events_observed: sockEvEventsObserved,
+    messages_upsert_observed: messagesUpsertObserved,
+    recent_sock_ev_events: recentSockEvEvents.slice(-40),
     last_inbound_event_at: lastInboundEventAt,
     last_inbound_post_at: lastInboundPostAt,
     last_inbound_post_status: lastInboundPostStatus,
     last_inbound_post_error: lastInboundPostError,
   };
+}
+
+function summarizeEvPayload(event, args) {
+  try {
+    if (event === "messages.upsert") {
+      const upsert = args?.[0] || {};
+      const messages = Array.isArray(upsert.messages) ? upsert.messages : [];
+      const first = messages[0];
+      return JSON.stringify({
+        type: upsert.type || null,
+        count: messages.length,
+        message_id: first?.key?.id || null,
+        remote_jid: first?.key?.remoteJid || null,
+        from_me: first?.key?.fromMe ?? null,
+      });
+    }
+    if (event === "connection.update") {
+      const u = args?.[0] || {};
+      return JSON.stringify({
+        connection: u.connection || null,
+        has_qr: Boolean(u.qr),
+        lastDisconnect: u.lastDisconnect?.error?.message || null,
+      });
+    }
+    if (event === "creds.update") return "creds.update";
+    if (event === "messages.update") {
+      const updates = Array.isArray(args?.[0]) ? args[0] : [];
+      return JSON.stringify({ count: updates.length });
+    }
+    return typeof args?.[0] === "object" ? Object.keys(args[0] || {}).slice(0, 8).join(",") : String(args?.[0] ?? "");
+  } catch {
+    return "unprintable";
+  }
+}
+
+function recordSockEvEvent(event, args) {
+  sockEvEventsObserved += 1;
+  const row = {
+    at: new Date().toISOString(),
+    event: String(event),
+    summary: summarizeEvPayload(event, args),
+  };
+  recentSockEvEvents.push(row);
+  if (recentSockEvEvents.length > RECENT_EV_MAX) {
+    recentSockEvEvents.splice(0, recentSockEvEvents.length - RECENT_EV_MAX);
+  }
+  inboundLog("sock.ev event", row);
+}
+
+function countListeners(sock) {
+  const ev = sock?.ev;
+  if (!ev) return { event_names: [], counts: {}, upsert: 0 };
+  const names =
+    typeof ev.eventNames === "function"
+      ? ev.eventNames().map(String)
+      : ["messages.upsert", "messages.update", "connection.update", "creds.update"];
+  const counts = {};
+  for (const name of names) {
+    counts[name] = typeof ev.listenerCount === "function" ? ev.listenerCount(name) : null;
+  }
+  const upsert =
+    typeof ev.listenerCount === "function" ? ev.listenerCount("messages.upsert") : null;
+  return { event_names: names, counts, upsert };
+}
+
+/**
+ * Spy on every sock.ev emit for windowMs after attach/open (runtime audit).
+ * Does not alter handler behavior.
+ */
+function spySockEvForWindow(clinicId, sock, windowMs = 30_000) {
+  const ev = sock?.ev;
+  if (!ev || typeof ev.emit !== "function") {
+    inboundError("sock.ev spy unavailable", { clinic_id: clinicId });
+    return;
+  }
+  if (ev.__ekshfliInboundSpyInstalled) {
+    inboundLog("sock.ev spy already installed", { clinic_id: clinicId });
+    return;
+  }
+  const originalEmit = ev.emit.bind(ev);
+  const startedAt = Date.now();
+  ev.__ekshfliInboundSpyInstalled = true;
+  ev.emit = (event, ...args) => {
+    if (Date.now() - startedAt <= windowMs) {
+      try {
+        recordSockEvEvent(event, args);
+      } catch {
+        /* never break Baileys */
+      }
+    }
+    return originalEmit(event, ...args);
+  };
+  inboundLog("sock.ev spy active for 30s", {
+    clinic_id: clinicId,
+    window_ms: windowMs,
+  });
+  setTimeout(() => {
+    inboundLog("sock.ev spy window ended", {
+      clinic_id: clinicId,
+      sock_ev_events_observed: sockEvEventsObserved,
+      messages_upsert_observed: messagesUpsertObserved,
+      recent_count: recentSockEvEvents.length,
+    });
+  }, windowMs + 50);
 }
 
 /** In-memory short-term dedupe (Laravel unique constraint is source of truth). */
@@ -665,15 +789,26 @@ export function attachInboundListeners(clinicId, sock) {
       file: "inbound.js",
       function: "attachInboundListeners",
     });
-    return;
+    return { attached: false, reason: "no_ev" };
   }
 
   if (inboundAttachedSocks.has(sock)) {
-    inboundLog("Listeners already attached on this socket — skip", { clinic_id: clinicId });
-    return;
+    const counts = countListeners(sock);
+    lastListenerCounts = counts.counts;
+    lastEventNamesAtAttach = counts.event_names;
+    lastUpsertListenerCount = counts.upsert;
+    inboundLog("Listeners already attached on this socket — skip", {
+      clinic_id: clinicId,
+      upsert_listener_count: counts.upsert,
+      event_names: counts.event_names,
+      listener_counts: counts.counts,
+    });
+    return { attached: false, reason: "already_attached", ...counts };
   }
   inboundAttachedSocks.add(sock);
   inboundAttachCount += 1;
+  lastAttachAt = new Date().toISOString();
+  lastAttachClinicId = clinicId;
 
   const cfg = getInboundWebhookConfig();
   inboundLog("Registering messages.upsert listener", {
@@ -692,15 +827,23 @@ export function attachInboundListeners(clinicId, sock) {
     });
   }
 
+  // Spy BEFORE registering so we also see our own attach-window traffic.
+  spySockEvForWindow(clinicId, sock, 30_000);
+
   sock.ev.on("messages.upsert", async (upsert) => {
     try {
       lastInboundEventAt = new Date().toISOString();
+      messagesUpsertObserved += 1;
       const type = upsert?.type || "notify";
       const messages = Array.isArray(upsert?.messages) ? upsert.messages : [];
+      const first = messages[0];
       inboundLog("messages.upsert fired", {
         clinic_id: clinicId,
         upsert_type: type,
         message_count: messages.length,
+        message_id: first?.key?.id || null,
+        remote_jid: first?.key?.remoteJid || null,
+        from_me: first?.key?.fromMe ?? null,
       });
 
       if (type !== "notify" && type !== "append") {
@@ -794,8 +937,32 @@ export function attachInboundListeners(clinicId, sock) {
     }
   });
 
+  const counts = countListeners(sock);
+  lastListenerCounts = counts.counts;
+  lastEventNamesAtAttach = counts.event_names;
+  lastUpsertListenerCount = counts.upsert;
+
+  console.log("[INBOUND] Listener attached successfully", {
+    clinic_id: clinicId,
+    upsert_listener_count: counts.upsert,
+    total_event_names: counts.event_names.length,
+    event_names: counts.event_names,
+    listener_counts: counts.counts,
+  });
+  inboundLog("Listener attached successfully", {
+    clinic_id: clinicId,
+    upsert_listener_count: counts.upsert,
+    total_listener_count: Object.values(counts.counts).reduce(
+      (a, b) => a + (typeof b === "number" ? b : 0),
+      0,
+    ),
+    event_names: counts.event_names,
+    listener_counts: counts.counts,
+  });
   inboundLog("Listeners attached", {
     clinic_id: clinicId,
     events: ["messages.upsert", "messages.update"],
+    upsert_listener_count: counts.upsert,
   });
+  return { attached: true, ...counts };
 }

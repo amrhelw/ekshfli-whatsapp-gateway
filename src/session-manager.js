@@ -422,6 +422,12 @@ export async function startSession(
         user?.id?.split(":")[0]?.replace(/\D/g, "") || entry.phoneNumber;
       entry.profileName =
         user?.name || user?.verifiedName || entry.profileName;
+      // Runtime guarantee: inbound listeners exist after every successful open.
+      console.log("[INBOUND] connection.open — ensuring attachInboundListeners", {
+        clinic_id: clinicId,
+        socket_generation_id: entry.socketGenerationId,
+      });
+      attachInboundListeners(clinicId, sock);
     }
 
     if (connection === "close") {
