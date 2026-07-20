@@ -235,6 +235,71 @@ function isSupportedChatJid(jid) {
   return lower.endsWith("@s.whatsapp.net") || lower.endsWith("@lid");
 }
 
+function isLidJid(jid) {
+  return String(jid || "").toLowerCase().endsWith("@lid");
+}
+
+function isPhoneJid(jid) {
+  return String(jid || "").toLowerCase().endsWith("@s.whatsapp.net");
+}
+
+/**
+ * Collect every possible phone/LID candidate from a Baileys message key.
+ */
+function collectIdentityCandidates(msg) {
+  const key = msg?.key || {};
+  const values = [
+    key.remoteJid,
+    key.remoteJidAlt,
+    key.participant,
+    key.participantAlt,
+    key.senderPn,
+    key.sender_pn,
+    msg?.senderPn,
+    msg?.remoteJidAlt,
+    msg?.participant,
+    msg?.participantAlt,
+    msg?.author,
+    msg?.pushNameSender || null,
+  ];
+  /** @type {string[]} */
+  const out = [];
+  for (const v of values) {
+    const n = normalizeJid(v ? String(v) : "");
+    if (n) out.push(n);
+  }
+  return out;
+}
+
+/**
+ * Ask Baileys LID mapping store for the phone JID when remoteJid is @lid.
+ * @param {import('@whiskeysockets/baileys').WASocket|null|undefined} sock
+ * @param {string} lidJid
+ */
+async function resolvePhoneJidFromLid(sock, lidJid) {
+  if (!sock || !isLidJid(lidJid)) return null;
+  try {
+    const mapping = sock.signalRepository?.lidMapping;
+    if (!mapping) return null;
+    if (typeof mapping.getPNForLID === "function") {
+      const pn = await mapping.getPNForLID(lidJid);
+      const normalized = normalizeJid(pn ? String(pn) : "");
+      return isPhoneJid(normalized) ? normalized : null;
+    }
+    if (typeof mapping.getPNForLIDSync === "function") {
+      const pn = mapping.getPNForLIDSync(lidJid);
+      const normalized = normalizeJid(pn ? String(pn) : "");
+      return isPhoneJid(normalized) ? normalized : null;
+    }
+  } catch (err) {
+    inboundLog("LID→PN mapping failed", {
+      lid: lidJid,
+      error: err?.message || String(err),
+    });
+  }
+  return null;
+}
+
 /**
  * Unwrap common Baileys message wrappers.
  * @param {object|null|undefined} message
@@ -493,13 +558,29 @@ function toUnixSeconds(ts) {
  * @param {number} clinicId
  * @param {import('@whiskeysockets/baileys').WAMessage} msg
  * @param {string} upsertType
+ * @param {{ phone_jid_from_lid?: string|null }} [opts]
  * @returns {object|null}
  */
-export function buildInboundPayload(clinicId, msg, upsertType) {
+export function buildInboundPayload(clinicId, msg, upsertType, opts = {}) {
   const key = msg?.key || {};
-  const remoteJid = normalizeJid(key.remoteJid || "");
-  // Baileys often provides phone JID here when remoteJid is @lid
-  const remoteJidAlt = normalizeJid(
+  const candidates = collectIdentityCandidates(msg);
+  const rawRemoteJid = normalizeJid(key.remoteJid || "");
+  let phoneJid = null;
+  let lidJid = null;
+  for (const c of candidates) {
+    if (!phoneJid && isPhoneJid(c)) phoneJid = c;
+    if (!lidJid && isLidJid(c)) lidJid = c;
+  }
+  if (!phoneJid && opts.phone_jid_from_lid && isPhoneJid(opts.phone_jid_from_lid)) {
+    phoneJid = normalizeJid(String(opts.phone_jid_from_lid));
+  }
+  if (!lidJid && isLidJid(rawRemoteJid)) {
+    lidJid = rawRemoteJid;
+  }
+
+  // Canonical primary identity: phone JID when known — never prefer @lid.
+  const remoteJid = phoneJid || rawRemoteJid;
+  const remoteJidAlt = phoneJid && lidJid ? phoneJid : normalizeJid(
     key.remoteJidAlt || key.participantAlt || msg?.remoteJidAlt || "",
   );
   const messageId = key.id ? String(key.id) : "";
@@ -518,6 +599,7 @@ export function buildInboundPayload(clinicId, msg, upsertType) {
         message_id: messageId,
         remote_jid: remoteJid || null,
         remote_jid_alt: remoteJidAlt || null,
+        candidates,
       },
       "whatsapp.inbound.dropped_unsupported_jid",
     );
@@ -541,13 +623,9 @@ export function buildInboundPayload(clinicId, msg, upsertType) {
     return null;
   }
 
-  const phoneJid =
-    remoteJidAlt && String(remoteJidAlt).toLowerCase().endsWith("@s.whatsapp.net")
-      ? remoteJidAlt
-      : null;
   const remotePhoneDigits = phoneJid
     ? String(phoneJid).split("@")[0].replace(/\D/g, "") || null
-    : remoteJid.toLowerCase().endsWith("@s.whatsapp.net")
+    : isPhoneJid(remoteJid)
       ? String(remoteJid).split("@")[0].replace(/\D/g, "") || null
       : null;
 
@@ -555,10 +633,14 @@ export function buildInboundPayload(clinicId, msg, upsertType) {
     event: "inbound_message",
     clinic_id: Number(clinicId),
     session_id: String(clinicId),
+    // Primary identity for Laravel — phone@s.whatsapp.net whenever available
     remote_jid: remoteJid,
-    remote_jid_alt: remoteJidAlt || null,
-    phone_jid: phoneJid,
+    remote_jid_raw: rawRemoteJid || null,
+    remote_jid_alt: remoteJidAlt || phoneJid || null,
+    phone_jid: phoneJid || (isPhoneJid(remoteJid) ? remoteJid : null),
     remote_phone: remotePhoneDigits,
+    remote_lid: lidJid ? String(lidJid).split("@")[0].replace(/\D/g, "") || null : null,
+    remote_lid_jid: lidJid || null,
     participant: key.participant ? normalizeJid(String(key.participant)) : null,
     message_id: messageId,
     timestamp: toUnixSeconds(msg.messageTimestamp),
@@ -573,6 +655,7 @@ export function buildInboundPayload(clinicId, msg, upsertType) {
     recipient_jid: fromMe ? remoteJid : null,
     upsert_type: upsertType || "notify",
     session_phone: null,
+    identity_candidates: candidates,
   };
 }
 
@@ -863,7 +946,21 @@ export function attachInboundListeners(clinicId, sock) {
       });
 
       for (const msg of messages) {
-        const payload = buildInboundPayload(clinicId, msg, type);
+        let phoneFromLid = null;
+        const rawJid = normalizeJid(msg?.key?.remoteJid || "");
+        if (isLidJid(rawJid)) {
+          phoneFromLid = await resolvePhoneJidFromLid(sock, rawJid);
+          if (phoneFromLid) {
+            inboundLog("Resolved LID to phone JID", {
+              clinic_id: clinicId,
+              lid: rawJid,
+              phone_jid: phoneFromLid,
+            });
+          }
+        }
+        const payload = buildInboundPayload(clinicId, msg, type, {
+          phone_jid_from_lid: phoneFromLid,
+        });
         if (!payload) {
           inboundLog("Early return — payload builder returned null", {
             clinic_id: clinicId,
