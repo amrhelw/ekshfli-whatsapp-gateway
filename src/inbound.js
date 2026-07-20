@@ -3,6 +3,7 @@
  * Does not alter outbound sendMessage pipeline.
  */
 import pino from "pino";
+import { extractNormalizedMessageContent } from "./message-content.js";
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
@@ -607,8 +608,7 @@ export function buildInboundPayload(clinicId, msg, upsertType, opts = {}) {
   }
 
   const fromMe = Boolean(key.fromMe);
-  const inner = unwrapMessage(msg.message);
-  const classified = classifyMessage(inner);
+  const classified = extractNormalizedMessageContent(msg.message);
 
   if (classified.message_type === "system") {
     logger.info(
@@ -648,6 +648,8 @@ export function buildInboundPayload(clinicId, msg, upsertType, opts = {}) {
     message_type: classified.message_type,
     text: classified.text,
     caption: classified.caption,
+    display_text: classified.display_text || classified.text || classified.caption || null,
+    body: classified.text || classified.caption || null,
     media: classified.media,
     quoted_message_id: classified.quoted_message_id,
     push_name: msg.pushName || null,
