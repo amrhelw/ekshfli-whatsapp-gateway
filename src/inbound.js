@@ -670,6 +670,9 @@ export function buildStatusPayload(clinicId, update) {
   const messageId = key.id ? String(key.id) : "";
   if (!messageId) return null;
 
+  // Delivery ticks are for outbound messages we sent.
+  if (key.fromMe === false) return null;
+
   let status = null;
   if (update.update?.status != null) {
     const code = Number(update.update.status);
@@ -687,6 +690,11 @@ export function buildStatusPayload(clinicId, update) {
 
   if (!status) return null;
 
+  const statusAt =
+    update.update?.messageTimestamp != null
+      ? Number(update.update.messageTimestamp)
+      : Math.floor(Date.now() / 1000);
+
   return {
     event: "message_status",
     clinic_id: Number(clinicId),
@@ -694,7 +702,8 @@ export function buildStatusPayload(clinicId, update) {
     message_id: messageId,
     remote_jid: key.remoteJid ? normalizeJid(String(key.remoteJid)) : null,
     status,
-    from_me: Boolean(key.fromMe),
+    status_at: statusAt,
+    from_me: key.fromMe !== false,
   };
 }
 
@@ -1024,6 +1033,12 @@ export function attachInboundListeners(clinicId, sock) {
       for (const update of updates) {
         const payload = buildStatusPayload(clinicId, update);
         if (!payload) continue;
+        inboundLog("message status receipt", {
+          clinic_id: clinicId,
+          message_id: payload.message_id,
+          status: payload.status,
+          from_me: payload.from_me,
+        });
         await postToLaravel(payload);
       }
     } catch (err) {
@@ -1032,6 +1047,12 @@ export function attachInboundListeners(clinicId, sock) {
         error: err?.message || String(err),
       });
     }
+  });
+
+  // After reconnect, Baileys re-emits pending acks via messages.update — no polling.
+  inboundLog("receipt listeners ready (reconnect-safe)", {
+    clinic_id: clinicId,
+    events: ["messages.update"],
   });
 
   const counts = countListeners(sock);
