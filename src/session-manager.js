@@ -30,6 +30,12 @@ import {
 } from "./voice-trace.js";
 import { prepareVoiceNoteAudio } from "./voice-transcode.js";
 import { attachInboundListeners } from "./inbound.js";
+import {
+  lifecycleAbort,
+  lifecycleEnter,
+  lifecycleException,
+  lifecycleExit,
+} from "./lifecycle-trace.js";
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
@@ -339,253 +345,392 @@ export async function startSession(
   caller = "startSession",
   options = {},
 ) {
-  const forceFresh = Boolean(options?.force_fresh);
-  const entry = entryFor(clinicId);
-  clearReconnectTimer(entry);
-  noteDiagPath(clinicId, "POST /internal/sessions/:id/start", {
+  const tStart = lifecycleEnter("startSession", {
+    clinic_id: clinicId,
     method,
     is_restore: isRestore,
-    force_fresh: forceFresh,
     caller,
+    force_fresh: Boolean(options?.force_fresh),
+    file: "session-manager.js",
+    function: "startSession",
   });
-
-  const wipeAuth = shouldWipeAuthBeforeStart(clinicId, isRestore, forceFresh);
-  if (wipeAuth) {
-    wipeAuthDirectory(clinicId, entry, {
-      reason: forceFresh ? "force_fresh" : "logged_out_or_invalid_auth",
-      caller,
+  try {
+    const forceFresh = Boolean(options?.force_fresh);
+    const entry = entryFor(clinicId);
+    clearReconnectTimer(entry);
+    noteDiagPath(clinicId, "POST /internal/sessions/:id/start", {
+      method,
       is_restore: isRestore,
+      force_fresh: forceFresh,
+      caller,
     });
-    // Clear sticky logout diagnosis so Connect can produce a fresh QR.
+
+    const wipeAuth = shouldWipeAuthBeforeStart(clinicId, isRestore, forceFresh);
+    if (wipeAuth) {
+      wipeAuthDirectory(clinicId, entry, {
+        reason: forceFresh ? "force_fresh" : "logged_out_or_invalid_auth",
+        caller,
+        is_restore: isRestore,
+      });
+      patchDiag(clinicId, {
+        logged_out_detected: false,
+        last_close_diagnostics: null,
+        last_disconnect_reason: null,
+        last_disconnect_status_code: null,
+      });
+      logger.info(
+        {
+          clinic_id: clinicId,
+          caller,
+          force_fresh: forceFresh,
+          is_restore: isRestore,
+        },
+        "whatsapp.session.auth_wiped_before_start",
+      );
+    }
+
     patchDiag(clinicId, {
+      start_called_at: new Date().toISOString(),
+      socket_created: false,
+      qr_generated: false,
+      connection_update_received: false,
+      last_start_error: null,
       logged_out_detected: false,
-      last_close_diagnostics: null,
-      last_disconnect_reason: null,
-      last_disconnect_status_code: null,
     });
+    entry.status = "connecting";
+    patchDiag(clinicId, { status: "connecting" });
+    entry.qr = null;
+    entry.pairingCode = null;
+    entry.lastError = null;
+
+    if (entry.sock) {
+      traceSocketDestroy(logger, {
+        clinicId,
+        caller: `${caller}:replace_existing_socket`,
+        entry,
+        extra: { method: "sock.end", is_restore: isRestore },
+      });
+      try {
+        entry.sock.end(undefined);
+      } catch {
+        /* ignore */
+      }
+      entry.sock = null;
+    }
+
+    const tAuth = lifecycleEnter("useMultiFileAuthState", {
+      clinic_id: clinicId,
+      auth_dir: entry.authDir,
+      file: "session-manager.js",
+      function: "startSession",
+    });
+    let state;
+    let saveCreds;
+    try {
+      ({ state, saveCreds } = await useMultiFileAuthState(entry.authDir));
+      lifecycleExit("useMultiFileAuthState", tAuth, {
+        returned: {
+          has_state: Boolean(state),
+          has_saveCreds: typeof saveCreds === "function",
+          auth_dir_exists: fs.existsSync(entry.authDir),
+        },
+      });
+    } catch (err) {
+      lifecycleException("useMultiFileAuthState", tAuth, err, {
+        clinic_id: clinicId,
+        auth_dir: entry.authDir,
+      });
+      throw err;
+    }
+
+    const tVer = lifecycleEnter("fetchLatestBaileysVersion", { clinic_id: clinicId });
+    let version;
+    try {
+      ({ version } = await fetchLatestBaileysVersion());
+      lifecycleExit("fetchLatestBaileysVersion", tVer, {
+        returned: { version },
+      });
+    } catch (err) {
+      lifecycleException("fetchLatestBaileysVersion", tVer, err, { clinic_id: clinicId });
+      throw err;
+    }
+
+    const socketGenerationId = nextSocketGenerationId(entry);
+    const tSock = lifecycleEnter("makeWASocket", {
+      clinic_id: clinicId,
+      socket_generation_id: socketGenerationId,
+      file: "session-manager.js",
+      function: "startSession",
+    });
+    let sock;
+    try {
+      sock = makeWASocket({
+        version,
+        auth: state,
+        logger,
+        printQRInTerminal: false,
+        generateHighQualityLinkPreview: false,
+      });
+      lifecycleExit("makeWASocket", tSock, {
+        returned: {
+          has_sock: Boolean(sock),
+          has_ev: Boolean(sock?.ev),
+        },
+      });
+    } catch (err) {
+      lifecycleException("makeWASocket", tSock, err, { clinic_id: clinicId });
+      throw err;
+    }
+
+    entry.sock = sock;
+    patchDiag(clinicId, {
+      socket_created: true,
+      socket_created_at: new Date().toISOString(),
+      socket_generation_id: socketGenerationId,
+    });
+
+    const wrappedSaveCreds = async (...args) => {
+      const tCreds = lifecycleEnter("saveCreds", {
+        clinic_id: clinicId,
+        file: "session-manager.js",
+        function: "creds.update → saveCreds",
+      });
+      try {
+        const result = await saveCreds(...args);
+        const credsPath = path.join(entry.authDir, "creds.json");
+        lifecycleExit("saveCreds", tCreds, {
+          returned: result ?? null,
+          creds_json_exists: fs.existsSync(credsPath),
+        });
+        return result;
+      } catch (err) {
+        lifecycleException("saveCreds", tCreds, err, { clinic_id: clinicId });
+        throw err;
+      }
+    };
+
+    sock.ev.on("creds.update", wrappedSaveCreds);
+
+    sock.ev.on("connection.update", async (update) => {
+      const tUpd = lifecycleEnter("connection.update", {
+        clinic_id: clinicId,
+        connection: update?.connection ?? null,
+        has_qr: Boolean(update?.qr),
+        file: "session-manager.js",
+        function: "connection.update handler",
+      });
+      try {
+        const { connection, lastDisconnect, qr } = update;
+        const d = diagFor(clinicId);
+        d.connection_update_count = (d.connection_update_count || 0) + 1;
+        patchDiag(clinicId, { connection_update_received: true });
+
+        if (qr) {
+          const tQr = lifecycleEnter("QR_generation", { clinic_id: clinicId });
+          try {
+            try {
+              entry.qr = await qrcode.toDataURL(qr);
+            } catch {
+              entry.qr = qr;
+            }
+            entry.status = "connecting";
+            patchDiag(clinicId, {
+              qr_generated: true,
+              qr_generated_at: new Date().toISOString(),
+              status: "connecting",
+            });
+            lifecycleExit("QR_generation", tQr, {
+              returned: {
+                qr_length: entry.qr ? String(entry.qr).length : 0,
+              },
+            });
+            logger.info(
+              {
+                clinic_id: clinicId,
+                qr_length: qrTraceLength(entry.qr),
+                qr_prefix: entry.qr ? String(entry.qr).slice(0, 30) : null,
+              },
+              "whatsapp.qr.trace.gateway_generated",
+            );
+          } catch (err) {
+            lifecycleException("QR_generation", tQr, err, { clinic_id: clinicId });
+          }
+        }
+
+        if (connection === "open") {
+          patchDiag(clinicId, {
+            connection_ever_open: true,
+            connection_reached_open_at: new Date().toISOString(),
+          });
+          entry.status = "connected";
+          entry.qr = null;
+          entry.pairingCode = null;
+          const user = sock.user;
+          entry.waJid = user?.id || null;
+          entry.phoneNumber =
+            user?.id?.split(":")[0]?.replace(/\D/g, "") || entry.phoneNumber;
+          entry.profileName =
+            user?.name || user?.verifiedName || entry.profileName;
+          console.log("[INBOUND] connection.open — ensuring attachInboundListeners", {
+            clinic_id: clinicId,
+            socket_generation_id: entry.socketGenerationId,
+          });
+          attachInboundListeners(clinicId, sock);
+        }
+
+        if (connection === "close") {
+          const closeDiagnostics = buildCloseDiagnostics({
+            sock,
+            authDir: entry.authDir,
+            diagState: d,
+            lastDisconnect,
+          });
+          const intentionalLogout =
+            closeDiagnostics.disconnect_reason_name === "loggedOut" ||
+            closeDiagnostics.last_disconnect_error_message === "Intentional Logout";
+          logger.info(
+            {
+              clinic_id: clinicId,
+              socket_generation_id: entry.socketGenerationId,
+              disconnect_reason_name: closeDiagnostics.disconnect_reason_name,
+              status_code: closeDiagnostics.last_disconnect_error_output_status_code,
+              is_boom: closeDiagnostics.error_is_boom,
+              logged_out: closeDiagnostics.disconnect_reason_name === "loggedOut",
+              intentional_logout: intentionalLogout,
+              last_disconnect_error_message:
+                closeDiagnostics.last_disconnect_error_message,
+              close: closeDiagnostics,
+            },
+            "whatsapp.connection.close.diagnostics",
+          );
+
+          const code = lastDisconnect?.error?.output?.statusCode;
+          const shouldReconnect = code !== DisconnectReason.loggedOut;
+          entry.status = shouldReconnect ? "reconnecting" : "disconnected";
+          entry.lastError = lastDisconnect?.error?.message || "Connection closed";
+          patchDiag(clinicId, {
+            last_close_diagnostics: closeDiagnostics,
+            last_disconnect_reason: entry.lastError,
+            last_disconnect_status_code: code ?? null,
+            restart_required_detected:
+              code === DisconnectReason.restartRequired || code === 515,
+            logged_out_detected:
+              code === DisconnectReason.loggedOut || code === 401,
+            status: entry.status,
+          });
+
+          if (code === DisconnectReason.loggedOut || code === 401) {
+            wipeAuthDirectory(clinicId, entry, {
+              reason: "baileys_logged_out",
+              disconnect_code: code ?? null,
+            });
+            entry.phoneNumber = null;
+            entry.waJid = null;
+            entry.profileName = null;
+            entry.qr = null;
+            entry.pairingCode = null;
+          }
+
+          if (shouldReconnect) {
+            scheduleSessionReconnect(clinicId, entry, {
+              method,
+              phone,
+              code,
+              disconnectMessage: entry.lastError,
+            });
+          } else {
+            clearReconnectTimer(entry);
+          }
+        }
+
+        lifecycleExit("connection.update", tUpd, {
+          connection: connection ?? null,
+          has_qr: Boolean(qr),
+          status: entry.status,
+        });
+      } catch (err) {
+        lifecycleException("connection.update", tUpd, err, { clinic_id: clinicId });
+      }
+    });
+
+    console.log("[INBOUND] session-manager calling attachInboundListeners", {
+      clinic_id: clinicId,
+      file: "session-manager.js",
+      function: "startSession",
+    });
+    attachInboundListeners(clinicId, sock);
+
+    if (method === "pairing" && phone) {
+      const digits = String(phone).replace(/\D/g, "");
+      entry.phoneNumber = digits;
+      try {
+        const code = await sock.requestPairingCode(digits);
+        entry.pairingCode = code;
+        entry.status = "connecting";
+      } catch (err) {
+        entry.lastError = err?.message || "Pairing code failed";
+        entry.status = "disconnected";
+        patchDiag(clinicId, {
+          last_start_error: entry.lastError,
+          status: "disconnected",
+        });
+      }
+    }
+
+    if (method === "qr") {
+      const tQrWait = lifecycleEnter("waitForQr", {
+        clinic_id: clinicId,
+        file: "session-manager.js",
+        function: "waitForQr",
+      });
+      const qrResult = await waitForQr(entry);
+      lifecycleExit("waitForQr", tQrWait, {
+        returned: qrResult ? `[qr len=${String(qrResult).length}]` : null,
+        entry_status: entry.status,
+        connection_update_count: diagFor(clinicId).connection_update_count || 0,
+      });
+      if (!qrResult && entry.status !== "connected") {
+        lifecycleAbort("waitForQr", "QR wait finished without qr and not connected", {
+          clinic_id: clinicId,
+          entry_status: entry.status,
+          connection_update_count: diagFor(clinicId).connection_update_count || 0,
+          file: "session-manager.js",
+          function: "waitForQr",
+        });
+      }
+    }
+
+    const out = getSessionStatus(clinicId);
+    if (out.qr) {
+      patchDiag(clinicId, { qr_delivered_in_start_response: true });
+    }
     logger.info(
       {
         clinic_id: clinicId,
-        caller,
-        force_fresh: forceFresh,
+        method,
         is_restore: isRestore,
+        qr_length: qrTraceLength(out.qr),
       },
-      "whatsapp.session.auth_wiped_before_start",
+      "whatsapp.qr.trace.gateway_start_response",
     );
-  }
-
-  patchDiag(clinicId, {
-    start_called_at: new Date().toISOString(),
-    socket_created: false,
-    qr_generated: false,
-    connection_update_received: false,
-    last_start_error: null,
-    logged_out_detected: false,
-  });
-  entry.status = "connecting";
-  patchDiag(clinicId, { status: "connecting" });
-  entry.qr = null;
-  entry.pairingCode = null;
-  entry.lastError = null;
-
-  if (entry.sock) {
-    traceSocketDestroy(logger, {
-      clinicId,
-      caller: `${caller}:replace_existing_socket`,
-      entry,
-      extra: { method: "sock.end", is_restore: isRestore },
+    lifecycleExit("startSession", tStart, {
+      returned: {
+        status: out.status,
+        has_qr: Boolean(out.qr),
+        has_jid: Boolean(out.wa_jid),
+        last_error: out.last_error,
+      },
     });
-    try {
-      entry.sock.end(undefined);
-    } catch {
-      /* ignore */
-    }
-    entry.sock = null;
-  }
-
-  const { state, saveCreds } = await useMultiFileAuthState(entry.authDir);
-  const { version } = await fetchLatestBaileysVersion();
-
-  const socketGenerationId = nextSocketGenerationId(entry);
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    logger,
-    printQRInTerminal: false,
-    generateHighQualityLinkPreview: false,
-  });
-
-  entry.sock = sock;
-  patchDiag(clinicId, {
-    socket_created: true,
-    socket_created_at: new Date().toISOString(),
-    socket_generation_id: socketGenerationId,
-  });
-
-  sock.ev.on("creds.update", saveCreds);
-
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    const d = diagFor(clinicId);
-    d.connection_update_count = (d.connection_update_count || 0) + 1;
-    patchDiag(clinicId, { connection_update_received: true });
-
-    if (qr) {
-      try {
-        entry.qr = await qrcode.toDataURL(qr);
-      } catch {
-        entry.qr = qr;
-      }
-      entry.status = "connecting";
-      patchDiag(clinicId, {
-        qr_generated: true,
-        qr_generated_at: new Date().toISOString(),
-        status: "connecting",
-      });
-      logger.info(
-        {
-          clinic_id: clinicId,
-          qr_length: qrTraceLength(entry.qr),
-          qr_prefix: entry.qr ? String(entry.qr).slice(0, 30) : null,
-        },
-        "whatsapp.qr.trace.gateway_generated",
-      );
-    }
-
-    if (connection === "open") {
-      patchDiag(clinicId, {
-        connection_ever_open: true,
-        connection_reached_open_at: new Date().toISOString(),
-      });
-      entry.status = "connected";
-      entry.qr = null;
-      entry.pairingCode = null;
-      const user = sock.user;
-      entry.waJid = user?.id || null;
-      entry.phoneNumber =
-        user?.id?.split(":")[0]?.replace(/\D/g, "") || entry.phoneNumber;
-      entry.profileName =
-        user?.name || user?.verifiedName || entry.profileName;
-      // Runtime guarantee: inbound listeners exist after every successful open.
-      console.log("[INBOUND] connection.open — ensuring attachInboundListeners", {
-        clinic_id: clinicId,
-        socket_generation_id: entry.socketGenerationId,
-      });
-      attachInboundListeners(clinicId, sock);
-    }
-
-    if (connection === "close") {
-      const closeDiagnostics = buildCloseDiagnostics({
-        sock,
-        authDir: entry.authDir,
-        diagState: d,
-        lastDisconnect,
-      });
-      const intentionalLogout =
-        closeDiagnostics.disconnect_reason_name === "loggedOut" ||
-        closeDiagnostics.last_disconnect_error_message === "Intentional Logout";
-      logger.info(
-        {
-          clinic_id: clinicId,
-          socket_generation_id: entry.socketGenerationId,
-          disconnect_reason_name: closeDiagnostics.disconnect_reason_name,
-          status_code: closeDiagnostics.last_disconnect_error_output_status_code,
-          is_boom: closeDiagnostics.error_is_boom,
-          logged_out: closeDiagnostics.disconnect_reason_name === "loggedOut",
-          intentional_logout: intentionalLogout,
-          last_disconnect_error_message:
-            closeDiagnostics.last_disconnect_error_message,
-          close: closeDiagnostics,
-        },
-        "whatsapp.connection.close.diagnostics",
-      );
-
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
-      entry.status = shouldReconnect ? "reconnecting" : "disconnected";
-      entry.lastError = lastDisconnect?.error?.message || "Connection closed";
-      patchDiag(clinicId, {
-        last_close_diagnostics: closeDiagnostics,
-        last_disconnect_reason: entry.lastError,
-        last_disconnect_status_code: code ?? null,
-        restart_required_detected:
-          code === DisconnectReason.restartRequired || code === 515,
-        logged_out_detected:
-          code === DisconnectReason.loggedOut || code === 401,
-        status: entry.status,
-      });
-
-      // Critical: logged-out auth cannot be reused. Wipe immediately so the next
-      // Connect (especially Super Admin global session clinic_id=0) can emit QR.
-      if (code === DisconnectReason.loggedOut || code === 401) {
-        wipeAuthDirectory(clinicId, entry, {
-          reason: "baileys_logged_out",
-          disconnect_code: code ?? null,
-        });
-        entry.phoneNumber = null;
-        entry.waJid = null;
-        entry.profileName = null;
-        entry.qr = null;
-        entry.pairingCode = null;
-      }
-
-      if (shouldReconnect) {
-        scheduleSessionReconnect(clinicId, entry, {
-          method,
-          phone,
-          code,
-          disconnectMessage: entry.lastError,
-        });
-      } else {
-        clearReconnectTimer(entry);
-      }
-    }
-  });
-
-  // Phase 1 Conversations: inbound upsert/status → Laravel webhook (outbound unchanged).
-  console.log("[INBOUND] session-manager calling attachInboundListeners", {
-    clinic_id: clinicId,
-    file: "session-manager.js",
-    function: "startSession",
-    line: 496,
-  });
-  attachInboundListeners(clinicId, sock);
-
-  if (method === "pairing" && phone) {
-    const digits = String(phone).replace(/\D/g, "");
-    entry.phoneNumber = digits;
-    try {
-      const code = await sock.requestPairingCode(digits);
-      entry.pairingCode = code;
-      entry.status = "connecting";
-    } catch (err) {
-      entry.lastError = err?.message || "Pairing code failed";
-      entry.status = "disconnected";
-      patchDiag(clinicId, {
-        last_start_error: entry.lastError,
-        status: "disconnected",
-      });
-    }
-  }
-
-  if (method === "qr") {
-    await waitForQr(entry);
-  }
-
-  const out = getSessionStatus(clinicId);
-  if (out.qr) {
-    patchDiag(clinicId, { qr_delivered_in_start_response: true });
-  }
-  logger.info(
-    {
+    return out;
+  } catch (err) {
+    lifecycleException("startSession", tStart, err, {
       clinic_id: clinicId,
-      method,
-      is_restore: isRestore,
-      qr_length: qrTraceLength(out.qr),
-    },
-    "whatsapp.qr.trace.gateway_start_response",
-  );
-  return out;
+      caller,
+      file: "session-manager.js",
+      function: "startSession",
+    });
+    throw err;
+  }
 }
 
 export async function reconnectSession(clinicId, caller = "reconnectSession") {

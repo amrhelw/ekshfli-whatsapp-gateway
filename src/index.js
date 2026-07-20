@@ -3,6 +3,14 @@ import pino from "pino";
 import { logVoiceTrace } from "./voice-trace.js";
 import { getInboundWebhookConfig } from "./inbound.js";
 import {
+  getLifecycleSnapshot,
+  lifecycleAbort,
+  lifecycleEnter,
+  lifecycleException,
+  lifecycleExit,
+  recordHttpAuth,
+} from "./lifecycle-trace.js";
+import {
   disconnectSession,
   getRestoreSummary,
   getSessionDiagnostics,
@@ -17,7 +25,8 @@ import {
 const app = express();
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 const PORT = Number(process.env.PORT || 3100);
-const TOKEN = process.env.GATEWAY_TOKEN || "";
+// Trim: Railway/UI env values often include trailing whitespace/newlines → false 403s.
+const TOKEN = String(process.env.GATEWAY_TOKEN || "").trim();
 
 app.use(express.json({ limit: "25mb" }));
 
@@ -26,17 +35,71 @@ app.use((req, res, next) => {
   if (req.method === "GET" && (req.path === "/health" || req.url?.startsWith("/health"))) {
     return next();
   }
-  console.log({
-    expected: process.env.GATEWAY_TOKEN ? "[set]" : undefined,
-    received: req.headers["x-gateway-token"] ? "[set]" : undefined,
+
+  const t0 = lifecycleEnter("http_auth_middleware", {
+    method: req.method,
+    path: req.path,
+    file: "index.js",
+    function: "auth middleware",
   });
-  if (!TOKEN) {
+
+  const header = String(req.headers["x-gateway-token"] || "").trim();
+  const tokenConfigured = TOKEN.length > 0;
+  const headerPresent = header.length > 0;
+
+  if (!tokenConfigured) {
+    recordHttpAuth({
+      rejected: false,
+      path: req.path,
+      method: req.method,
+      reason: "GATEWAY_TOKEN empty — auth skipped",
+      token_configured: false,
+      header_present: headerPresent,
+    });
+    lifecycleExit("http_auth_middleware", t0, { allowed: true, reason: "token_not_configured" });
     return next();
   }
-  const header = req.headers["x-gateway-token"];
+
   if (header !== TOKEN) {
+    const condition = !headerPresent
+      ? "missing x-gateway-token header"
+      : `x-gateway-token length ${header.length} !== GATEWAY_TOKEN length ${TOKEN.length} (or value mismatch)`;
+    recordHttpAuth({
+      rejected: true,
+      path: req.path,
+      method: req.method,
+      condition,
+      token_configured: true,
+      header_present: headerPresent,
+      header_len: header.length,
+      token_len: TOKEN.length,
+      lengths_equal: header.length === TOKEN.length,
+    });
+    lifecycleAbort("http_auth_middleware", condition, {
+      file: "index.js",
+      function: "auth middleware",
+      line: 52,
+      path: req.path,
+      method: req.method,
+      http_status: 403,
+    });
+    lifecycleExit("http_auth_middleware", t0, {
+      allowed: false,
+      returned: { success: false, message: "Invalid gateway token." },
+    });
     return res.status(403).json({ success: false, message: "Invalid gateway token." });
   }
+
+  recordHttpAuth({
+    rejected: false,
+    path: req.path,
+    method: req.method,
+    token_configured: true,
+    header_present: true,
+    header_len: header.length,
+    token_len: TOKEN.length,
+  });
+  lifecycleExit("http_auth_middleware", t0, { allowed: true });
   next();
 });
 
@@ -47,6 +110,7 @@ app.get("/health", (_req, res) => {
     service: "ekshfli-whatsapp-gateway",
     inbound,
     restore: getRestoreSummary(),
+    lifecycle: getLifecycleSnapshot(),
   });
 });
 
@@ -59,6 +123,13 @@ app.post("/internal/sessions/:clinicId/start", async (req, res) => {
     req.body?.force_fresh === 1 ||
     req.body?.force_fresh === "1" ||
     req.body?.force_fresh === "true";
+  const t0 = lifecycleEnter("HTTP_startConnection", {
+    clinic_id: clinicId,
+    method,
+    force_fresh: forceFresh,
+    file: "index.js",
+    function: "POST /internal/sessions/:clinicId/start",
+  });
   try {
     const data = await startSession(
       clinicId,
@@ -68,11 +139,21 @@ app.post("/internal/sessions/:clinicId/start", async (req, res) => {
       `HTTP:POST /internal/sessions/${clinicId}/start`,
       { force_fresh: forceFresh },
     );
+    lifecycleExit("HTTP_startConnection", t0, {
+      returned_status: data?.status ?? null,
+      returned_qr: Boolean(data?.qr),
+      returned_has_jid: Boolean(data?.wa_jid),
+    });
     res.json({ success: true, data });
   } catch (err) {
+    lifecycleException("HTTP_startConnection", t0, err, {
+      clinic_id: clinicId,
+      file: "index.js",
+    });
     res.status(500).json({ success: false, message: err?.message || "Start failed" });
   }
 });
+
 
 app.get("/internal/sessions/:clinicId/status", (req, res) => {
   const clinicId = Number(req.params.clinicId);
