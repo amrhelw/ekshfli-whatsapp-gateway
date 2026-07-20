@@ -29,6 +29,7 @@ import {
   voiceFileInfo,
 } from "./voice-trace.js";
 import { prepareVoiceNoteAudio } from "./voice-transcode.js";
+import { attachInboundListeners } from "./inbound.js";
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
@@ -82,12 +83,70 @@ function waitForQr(entry, timeoutMs = 20000) {
         resolve(null);
         return;
       }
+      // Logged-out / failed starts never emit QR — exit early instead of
+      // returning a fake "success" after the full wait window.
+      if (entry.status === "disconnected") {
+        clearInterval(timer);
+        resolve(null);
+        return;
+      }
       if (Date.now() >= deadline) {
         clearInterval(timer);
         resolve(null);
       }
     }, 250);
   });
+}
+
+function wipeAuthDirectory(clinicId, entry, reason) {
+  if (!entry?.authDir) {
+    return false;
+  }
+  if (!fs.existsSync(entry.authDir)) {
+    return false;
+  }
+  const reasonMeta =
+    reason && typeof reason === "object" ? reason : { reason: reason ?? "unspecified" };
+  traceSessionCleanup(logger, {
+    clinicId,
+    caller: "wipeAuthDirectory",
+    entry,
+    extra: {
+      action: "auth_directory_removed",
+      auth_dir: entry.authDir,
+      ...reasonMeta,
+    },
+  });
+  fs.rmSync(entry.authDir, { recursive: true, force: true });
+  return true;
+}
+
+/**
+ * Dead Baileys creds (loggedOut / 401) must be wiped before start, otherwise
+ * Connect reloads invalid auth, never emits QR, and diagnostics stay FAILED.
+ */
+function shouldWipeAuthBeforeStart(clinicId, isRestore, forceFresh) {
+  if (forceFresh) {
+    return true;
+  }
+  const d = diagFor(clinicId);
+  if (d.logged_out_detected === true) {
+    return true;
+  }
+  const last = d.last_close_diagnostics;
+  if (
+    last &&
+    (last.disconnect_reason_name === "loggedOut" ||
+      last.last_disconnect_error_output_status_code === 401 ||
+      last.last_disconnect_error_output_status_code === DisconnectReason.loggedOut)
+  ) {
+    return true;
+  }
+  // Restore of a previously logged-out session must not resurrect dead creds.
+  if (isRestore && d.logged_out_detected === true) {
+    return true;
+  }
+  return false;
 }
 
 function entryFor(clinicId) {
@@ -234,20 +293,50 @@ export async function startSession(
   phone = null,
   isRestore = false,
   caller = "startSession",
+  options = {},
 ) {
+  const forceFresh = Boolean(options?.force_fresh);
   const entry = entryFor(clinicId);
   clearReconnectTimer(entry);
   noteDiagPath(clinicId, "POST /internal/sessions/:id/start", {
     method,
     is_restore: isRestore,
+    force_fresh: forceFresh,
     caller,
   });
+
+  const wipeAuth = shouldWipeAuthBeforeStart(clinicId, isRestore, forceFresh);
+  if (wipeAuth) {
+    wipeAuthDirectory(clinicId, entry, {
+      reason: forceFresh ? "force_fresh" : "logged_out_or_invalid_auth",
+      caller,
+      is_restore: isRestore,
+    });
+    // Clear sticky logout diagnosis so Connect can produce a fresh QR.
+    patchDiag(clinicId, {
+      logged_out_detected: false,
+      last_close_diagnostics: null,
+      last_disconnect_reason: null,
+      last_disconnect_status_code: null,
+    });
+    logger.info(
+      {
+        clinic_id: clinicId,
+        caller,
+        force_fresh: forceFresh,
+        is_restore: isRestore,
+      },
+      "whatsapp.session.auth_wiped_before_start",
+    );
+  }
+
   patchDiag(clinicId, {
     start_called_at: new Date().toISOString(),
     socket_created: false,
     qr_generated: false,
     connection_update_received: false,
     last_start_error: null,
+    logged_out_detected: false,
   });
   entry.status = "connecting";
   patchDiag(clinicId, { status: "connecting" });
@@ -376,6 +465,20 @@ export async function startSession(
         status: entry.status,
       });
 
+      // Critical: logged-out auth cannot be reused. Wipe immediately so the next
+      // Connect (especially Super Admin global session clinic_id=0) can emit QR.
+      if (code === DisconnectReason.loggedOut || code === 401) {
+        wipeAuthDirectory(clinicId, entry, {
+          reason: "baileys_logged_out",
+          disconnect_code: code ?? null,
+        });
+        entry.phoneNumber = null;
+        entry.waJid = null;
+        entry.profileName = null;
+        entry.qr = null;
+        entry.pairingCode = null;
+      }
+
       if (shouldReconnect) {
         scheduleSessionReconnect(clinicId, entry, {
           method,
@@ -388,6 +491,15 @@ export async function startSession(
       }
     }
   });
+
+  // Phase 1 Conversations: inbound upsert/status → Laravel webhook (outbound unchanged).
+  console.log("[INBOUND] session-manager calling attachInboundListeners", {
+    clinic_id: clinicId,
+    file: "session-manager.js",
+    function: "startSession",
+    line: 496,
+  });
+  attachInboundListeners(clinicId, sock);
 
   if (method === "pairing" && phone) {
     const digits = String(phone).replace(/\D/g, "");

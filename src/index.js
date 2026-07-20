@@ -1,6 +1,7 @@
 import express from "express";
 import pino from "pino";
 import { logVoiceTrace } from "./voice-trace.js";
+import { getInboundWebhookConfig } from "./inbound.js";
 import {
   disconnectSession,
   getSessionDiagnostics,
@@ -35,13 +36,23 @@ app.use((req, res, next) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ success: true, service: "ekshfli-whatsapp-gateway" });
+  const inbound = getInboundWebhookConfig();
+  res.json({
+    success: true,
+    service: "ekshfli-whatsapp-gateway",
+    inbound,
+  });
 });
 
 app.post("/internal/sessions/:clinicId/start", async (req, res) => {
   const clinicId = Number(req.params.clinicId);
   const method = req.body?.method === "pairing" ? "pairing" : "qr";
   const phone = req.body?.phone || null;
+  const forceFresh =
+    req.body?.force_fresh === true ||
+    req.body?.force_fresh === 1 ||
+    req.body?.force_fresh === "1" ||
+    req.body?.force_fresh === "true";
   try {
     const data = await startSession(
       clinicId,
@@ -49,6 +60,7 @@ app.post("/internal/sessions/:clinicId/start", async (req, res) => {
       phone,
       false,
       `HTTP:POST /internal/sessions/${clinicId}/start`,
+      { force_fresh: forceFresh },
     );
     res.json({ success: true, data });
   } catch (err) {
@@ -122,5 +134,12 @@ app.post("/internal/messages/send", async (req, res) => {
 
 app.listen(PORT, async () => {
   console.log(`Ekshfli WhatsApp Gateway listening on :${PORT}`);
+  const inbound = getInboundWebhookConfig();
+  console.log("[INBOUND] Boot webhook config", JSON.stringify(inbound));
+  if (!inbound.webhook_url_configured) {
+    console.error(
+      "[INBOUND] FIRST FAILING LINE: postToLaravel — LARAVEL_WEBHOOK_URL is empty (inbound.js). Laravel will never receive inbound messages.",
+    );
+  }
   await restoreAllSessions();
 });
