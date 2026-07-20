@@ -78,7 +78,7 @@ app.use((req, res, next) => {
     lifecycleAbort("http_auth_middleware", condition, {
       file: "index.js",
       function: "auth middleware",
-      line: 52,
+      line: 90,
       path: req.path,
       method: req.method,
       http_status: 403,
