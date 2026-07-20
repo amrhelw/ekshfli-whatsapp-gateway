@@ -236,6 +236,16 @@ function scheduleSessionReconnect(
   }, delay);
 }
 
+let lastRestoreSummary = null;
+
+export function setRestoreSummary(summary) {
+  lastRestoreSummary = summary;
+}
+
+export function getRestoreSummary() {
+  return lastRestoreSummary;
+}
+
 /** Read-only session snapshot for status polling — no side effects. */
 export function getSessionStatus(clinicId) {
   const entry = entryFor(clinicId);
@@ -272,19 +282,53 @@ export function getSessionDiagnostics(clinicId) {
 
 export async function restoreAllSessions() {
   const root = sessionsRoot();
-  if (!fs.existsSync(root)) return;
+  const summary = {
+    restore_started_at: new Date().toISOString(),
+    sessions_root: root,
+    root_exists: fs.existsSync(root),
+    dirs_found: 0,
+    creds_found: 0,
+    start_attempted: 0,
+    start_ok: 0,
+    start_errors: [],
+  };
+  console.log("[INBOUND] restoreAllSessions begin", JSON.stringify(summary));
+  if (!fs.existsSync(root)) {
+    console.log("[INBOUND] restoreAllSessions SKIP — sessions root missing", JSON.stringify(summary));
+    setRestoreSummary(summary);
+    return summary;
+  }
 
   const dirs = fs
     .readdirSync(root, { withFileTypes: true })
     .filter((d) => d.isDirectory());
+  summary.dirs_found = dirs.length;
   for (const dir of dirs) {
     const clinicId = Number.parseInt(dir.name, 10);
     if (!Number.isFinite(clinicId)) continue;
     const creds = path.join(root, dir.name, "creds.json");
     if (fs.existsSync(creds)) {
-      await startSession(clinicId, "qr", null, true, "restoreAllSessions");
+      summary.creds_found += 1;
+      summary.start_attempted += 1;
+      try {
+        await startSession(clinicId, "qr", null, true, "restoreAllSessions");
+        summary.start_ok += 1;
+      } catch (err) {
+        summary.start_errors.push({
+          clinic_id: clinicId,
+          error: err?.message || String(err),
+        });
+        console.error("[INBOUND] restoreAllSessions startSession failed", {
+          clinic_id: clinicId,
+          error: err?.message || String(err),
+        });
+      }
     }
   }
+  summary.restore_finished_at = new Date().toISOString();
+  console.log("[INBOUND] restoreAllSessions end", JSON.stringify(summary));
+  setRestoreSummary(summary);
+  return summary;
 }
 
 export async function startSession(

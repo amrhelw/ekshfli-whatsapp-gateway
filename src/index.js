@@ -4,6 +4,7 @@ import { logVoiceTrace } from "./voice-trace.js";
 import { getInboundWebhookConfig } from "./inbound.js";
 import {
   disconnectSession,
+  getRestoreSummary,
   getSessionDiagnostics,
   getSessionStatus,
   reconnectSession,
@@ -45,6 +46,7 @@ app.get("/health", (_req, res) => {
     success: true,
     service: "ekshfli-whatsapp-gateway",
     inbound,
+    restore: getRestoreSummary(),
   });
 });
 
