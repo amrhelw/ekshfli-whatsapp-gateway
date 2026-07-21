@@ -109,6 +109,21 @@ app.get("/health", (_req, res) => {
   res.json({
     success: true,
     service: "ekshfli-whatsapp-gateway",
+    // Railway injects RAILWAY_GIT_COMMIT_SHA on deploy — use to verify live build.
+    build: {
+      git_commit_sha:
+        process.env.RAILWAY_GIT_COMMIT_SHA ||
+        process.env.RAILWAY_GIT_COMMIT ||
+        null,
+      git_author:
+        process.env.RAILWAY_GIT_AUTHOR ||
+        null,
+      git_branch:
+        process.env.RAILWAY_GIT_BRANCH ||
+        null,
+      deployment_id: process.env.RAILWAY_DEPLOYMENT_ID || null,
+      environment_name: process.env.RAILWAY_ENVIRONMENT_NAME || null,
+    },
     inbound,
     restore: getRestoreSummary(),
     lifecycle: getLifecycleSnapshot(),
