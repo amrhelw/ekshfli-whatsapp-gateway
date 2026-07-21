@@ -3,7 +3,11 @@
  * Does not alter outbound sendMessage pipeline.
  */
 import pino from "pino";
-import { extractNormalizedMessageContent } from "./message-content.js";
+import {
+  normalizeIncomingMessage,
+  serializeMessageForWebhook,
+} from "./message-content.js";
+import { resolveProfilePictureUrl, resolveProfilePictureUrlCandidates } from "./profile-photo.js";
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
@@ -559,7 +563,7 @@ function toUnixSeconds(ts) {
  * @param {number} clinicId
  * @param {import('@whiskeysockets/baileys').WAMessage} msg
  * @param {string} upsertType
- * @param {{ phone_jid_from_lid?: string|null }} [opts]
+ * @param {{ phone_jid_from_lid?: string|null, profile_picture_url?: string|null, profile_picture_unavailable?: boolean }} [opts]
  * @returns {object|null}
  */
 export function buildInboundPayload(clinicId, msg, upsertType, opts = {}) {
@@ -608,7 +612,7 @@ export function buildInboundPayload(clinicId, msg, upsertType, opts = {}) {
   }
 
   const fromMe = Boolean(key.fromMe);
-  const classified = extractNormalizedMessageContent(msg.message);
+  const classified = normalizeIncomingMessage(msg.message);
 
   if (classified.message_type === "system") {
     logger.info(
@@ -629,6 +633,27 @@ export function buildInboundPayload(clinicId, msg, upsertType, opts = {}) {
       ? String(remoteJid).split("@")[0].replace(/\D/g, "") || null
       : null;
 
+  const displayText =
+    classified.display_text || classified.text || classified.caption || null;
+  const bodyText = classified.text || classified.caption || null;
+  const rawMessage = serializeMessageForWebhook(msg.message);
+
+  // When text is missing for a text/unknown message, keep raw proto for Laravel recovery.
+  if (!bodyText && (classified.message_type === "text" || classified.message_type === "unknown")) {
+    logger.warn(
+      {
+        clinic_id: clinicId,
+        message_id: messageId,
+        message_type: classified.message_type,
+        message_keys: msg.message && typeof msg.message === "object"
+          ? Object.keys(msg.message).slice(0, 40)
+          : [],
+        raw_message: rawMessage,
+      },
+      "whatsapp.inbound.empty_text_payload",
+    );
+  }
+
   return {
     event: "inbound_message",
     clinic_id: Number(clinicId),
@@ -648,11 +673,16 @@ export function buildInboundPayload(clinicId, msg, upsertType, opts = {}) {
     message_type: classified.message_type,
     text: classified.text,
     caption: classified.caption,
-    display_text: classified.display_text || classified.text || classified.caption || null,
-    body: classified.text || classified.caption || null,
+    display_text: displayText,
+    body: bodyText,
     media: classified.media,
     quoted_message_id: classified.quoted_message_id,
+    // Laravel fallback: re-parse if top-level text was dropped
+    raw_message: rawMessage,
+    message: rawMessage,
     push_name: msg.pushName || null,
+    profile_picture_url: opts.profile_picture_url ?? null,
+    profile_picture_unavailable: Boolean(opts.profile_picture_unavailable),
     sender_jid: fromMe ? null : remoteJid,
     recipient_jid: fromMe ? remoteJid : null,
     upsert_type: upsertType || "notify",
@@ -731,7 +761,7 @@ async function postToLaravel(payload, attempt = 1) {
   const tokenSource = webhookToken ? "WEBHOOK_TOKEN" : gatewayToken ? "GATEWAY_TOKEN" : "none";
 
   const headers = {
-    "Content-Type": "application/json",
+    "Content-Type": "application/json; charset=utf-8",
     Accept: "application/json",
   };
   if (token) {
@@ -984,6 +1014,40 @@ export function attachInboundListeners(clinicId, sock) {
           continue;
         }
 
+        // Best-effort profile photo (cached); never block / fail inbound on privacy errors.
+        try {
+          const pic = await resolveProfilePictureUrlCandidates(
+            sock,
+            [payload.phone_jid, payload.remote_jid, payload.remote_jid_alt, payload.remote_lid_jid],
+            { clinicId, force: false },
+          );
+          payload.profile_picture_url = pic.url;
+          payload.profile_photo_url = pic.url;
+          payload.profile_picture_unavailable = Boolean(pic.unavailable);
+          payload.profile_photo_unavailable = Boolean(pic.unavailable);
+          inboundLog("Profile picture resolve", {
+            clinic_id: clinicId,
+            message_id: payload.message_id,
+            jid_tried: payload.phone_jid || payload.remote_jid,
+            url: pic.url ? String(pic.url).slice(0, 120) : null,
+            unavailable: pic.unavailable,
+            from_cache: pic.from_cache,
+            reason: pic.reason || null,
+            file: "inbound.js",
+            function: "resolveProfilePictureUrlCandidates",
+          });
+        } catch (picErr) {
+          payload.profile_picture_url = null;
+          payload.profile_picture_unavailable = false; // allow Laravel/Admin soft retry
+          inboundLog("Profile picture resolve failed", {
+            clinic_id: clinicId,
+            message_id: payload.message_id,
+            error: String(picErr?.message || picErr || "unknown"),
+            file: "inbound.js",
+            function: "resolveProfilePictureUrlCandidates",
+          });
+        }
+
         if (seenRecently(clinicId, payload.message_id)) {
           inboundLog("Early return — local dedupe", {
             clinic_id: clinicId,
@@ -1000,6 +1064,13 @@ export function attachInboundListeners(clinicId, sock) {
           remote_jid: payload.remote_jid,
           message_type: payload.message_type,
           from_me: payload.from_me,
+          text_len: payload.text ? String(payload.text).length : 0,
+          text_preview: payload.text
+            ? String(payload.text).slice(0, 80)
+            : payload.caption
+              ? String(payload.caption).slice(0, 80)
+              : null,
+          has_arabic: /[\u0600-\u06FF]/.test(String(payload.text || payload.caption || "")),
         });
 
         const postResult = await postToLaravel(payload);
@@ -1051,10 +1122,48 @@ export function attachInboundListeners(clinicId, sock) {
     }
   });
 
+  // Profile picture / contact metadata changes from WhatsApp.
+  sock.ev.on("contacts.update", async (updates) => {
+    try {
+      if (!Array.isArray(updates)) return;
+      for (const contact of updates) {
+        const jid = normalizeJid(contact?.id || contact?.jid || "");
+        if (!jid || !isSupportedChatJid(jid)) continue;
+        // Baileys often signals a change with imgUrl === "changed" — always re-fetch.
+        const pic = await resolveProfilePictureUrl(sock, jid, {
+          clinicId,
+          force: true,
+        });
+        const phoneDigits = isPhoneJid(jid)
+          ? String(jid).split("@")[0].replace(/\D/g, "") || null
+          : null;
+        await postToLaravel({
+          event: "profile_picture_update",
+          clinic_id: Number(clinicId),
+          session_id: String(clinicId),
+          remote_jid: jid,
+          phone_jid: isPhoneJid(jid) ? jid : null,
+          remote_phone: phoneDigits,
+          profile_picture_url: pic.url,
+          profile_photo_url: pic.url,
+          profile_picture_unavailable: pic.unavailable,
+          profile_photo_unavailable: pic.unavailable,
+          push_name: contact?.notify || contact?.name || null,
+          display_name: contact?.name || contact?.notify || null,
+        });
+      }
+    } catch (err) {
+      inboundError("Exception in contacts.update handler", {
+        clinic_id: clinicId,
+        error: err?.message || String(err),
+      });
+    }
+  });
+
   // After reconnect, Baileys re-emits pending acks via messages.update — no polling.
   inboundLog("receipt listeners ready (reconnect-safe)", {
     clinic_id: clinicId,
-    events: ["messages.update"],
+    events: ["messages.update", "contacts.update"],
   });
 
   const counts = countListeners(sock);

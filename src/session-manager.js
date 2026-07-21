@@ -23,6 +23,7 @@ import {
   traceSessionCleanup,
   traceSocketDestroy,
 } from "./session-trace.js";
+import { resolveProfilePictureUrl } from "./profile-photo.js";
 import {
   logVoiceTrace,
   sanitizePayloadForLog,
@@ -1263,4 +1264,128 @@ export async function sendMessage(payload) {
     }
     return { success: false, message: err?.message || "Send failed" };
   }
+}
+
+/**
+ * Fetch contact profile picture URL for Laravel cache (manual refresh / start conversation).
+ * Always returns JSON-serializable { success, data|message } — never HTML/plain text.
+ *
+ * @param {number|string} clinicId
+ * @param {string} jid
+ * @param {boolean} [force]
+ */
+export async function fetchProfilePicture(clinicId, jid, force = false) {
+  const fetchedAt = new Date().toISOString();
+  const id = Number(clinicId);
+  const entry = entryFor(id);
+
+  if (entry.status !== "connected" || !entry.sock) {
+    return {
+      success: false,
+      message: "WhatsApp session not connected for this clinic.",
+      data: {
+        jid: String(jid || "").trim() || null,
+        profile_photo_url: null,
+        profile_picture_url: null,
+        profile_photo_unavailable: false,
+        reason: "session_not_connected",
+        fetched_at: fetchedAt,
+      },
+    };
+  }
+
+  let target = String(jid || "").trim();
+  if (!target) {
+    return {
+      success: false,
+      message: "JID is required.",
+      data: {
+        jid: null,
+        profile_photo_url: null,
+        profile_picture_url: null,
+        profile_photo_unavailable: false,
+        reason: "missing_jid",
+        fetched_at: fetchedAt,
+      },
+    };
+  }
+  if (!target.includes("@")) {
+    const digits = target.replace(/\D/g, "");
+    if (!digits) {
+      return {
+        success: false,
+        message: "JID is required.",
+        data: {
+          jid: null,
+          profile_photo_url: null,
+          profile_picture_url: null,
+          profile_photo_unavailable: false,
+          reason: "missing_jid",
+          fetched_at: fetchedAt,
+        },
+      };
+    }
+    target = phoneToJid(digits);
+  }
+
+  // Best-effort contact names from Baileys store (when available).
+  let displayName = null;
+  let pushName = null;
+  try {
+    const contacts = entry.sock?.store?.contacts || entry.sock?.contacts || null;
+    const contact = contacts?.[target] || contacts?.[target.split("@")[0]] || null;
+    if (contact && typeof contact === "object") {
+      displayName =
+        contact.name ||
+        contact.verifiedName ||
+        contact.notify ||
+        null;
+      pushName = contact.notify || contact.name || null;
+      if (displayName) displayName = String(displayName);
+      if (pushName) pushName = String(pushName);
+    }
+  } catch {
+    /* ignore store gaps */
+  }
+
+  const result = await resolveProfilePictureUrl(entry.sock, target, {
+    clinicId: id,
+    force: Boolean(force),
+  });
+
+  logger.info(
+    {
+      clinic_id: id,
+      jid: target,
+      url: result.url ? String(result.url).slice(0, 160) : null,
+      unavailable: result.unavailable,
+      from_cache: result.from_cache,
+      reason: result.reason || null,
+      force: Boolean(force),
+    },
+    "whatsapp.profile_picture.http_fetch",
+  );
+
+  const unavailable = Boolean(result.unavailable) && !result.url;
+  const reason =
+    result.reason ||
+    (result.url ? "ok" : unavailable ? "privacy" : "empty");
+
+  // Always success:true for a completed Baileys lookup (including privacy/empty).
+  // Laravel treats success + null URL + profile_photo_unavailable as a soft miss.
+  return {
+    success: true,
+    data: {
+      jid: target,
+      profile_photo_url: result.url || null,
+      profile_picture_url: result.url || null, // backward-compatible alias
+      profile_photo_unavailable: unavailable,
+      unavailable, // backward-compatible alias
+      display_name: displayName,
+      push_name: pushName,
+      fetched_at: fetchedAt,
+      from_cache: Boolean(result.from_cache),
+      reason,
+    },
+  };
 }

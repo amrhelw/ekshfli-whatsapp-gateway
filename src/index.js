@@ -12,6 +12,7 @@ import {
 } from "./lifecycle-trace.js";
 import {
   disconnectSession,
+  fetchProfilePicture,
   getRestoreSummary,
   getSessionDiagnostics,
   getSessionStatus,
@@ -160,6 +161,53 @@ app.get("/internal/sessions/:clinicId/status", (req, res) => {
   res.json({ success: true, data: getSessionStatus(clinicId) });
 });
 
+app.get("/internal/sessions/:clinicId/profile-picture", async (req, res) => {
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  const clinicId = Number(req.params.clinicId);
+  const jid = String(req.query.jid || req.query.phone || "").trim();
+  const force =
+    req.query.force === "1" ||
+    req.query.force === "true" ||
+    req.query.force === true;
+  try {
+    const result = await fetchProfilePicture(clinicId, jid, force);
+    // Always JSON. Privacy / empty photo → HTTP 200 + success true.
+    // Session/JID errors → HTTP 422 + success false (still JSON).
+    const status = result?.success ? 200 : 422;
+    return res.status(status).json(
+      result && typeof result === "object"
+        ? result
+        : {
+            success: false,
+            message: "Profile picture fetch returned an empty result.",
+            data: {
+              jid: jid || null,
+              profile_photo_url: null,
+              profile_photo_unavailable: false,
+              reason: "empty_result",
+              fetched_at: new Date().toISOString(),
+            },
+          },
+    );
+  } catch (err) {
+    logger.error(
+      { clinic_id: clinicId, jid, error: err?.message || String(err) },
+      "whatsapp.profile_picture.http_error",
+    );
+    return res.status(500).json({
+      success: false,
+      message: err?.message || "Profile picture fetch failed",
+      data: {
+        jid: jid || null,
+        profile_photo_url: null,
+        profile_photo_unavailable: false,
+        reason: "exception",
+        fetched_at: new Date().toISOString(),
+      },
+    });
+  }
+});
+
 app.get("/internal/sessions/:clinicId/diagnostics", (req, res) => {
   const clinicId = Number(req.params.clinicId);
   res.json({ success: true, data: getSessionDiagnostics(clinicId) });
@@ -217,6 +265,15 @@ app.post("/internal/messages/send", async (req, res) => {
   }
   const result = await sendMessage(body);
   res.status(result.success ? 200 : 422).json(result);
+});
+
+// Never return HTML for unknown /internal routes (Laravel expects JSON).
+app.use("/internal", (req, res) => {
+  res.status(404).json({
+    success: false,
+    message: `Gateway route not found: ${req.method} ${req.originalUrl}`,
+    data: null,
+  });
 });
 
 app.listen(PORT, async () => {
