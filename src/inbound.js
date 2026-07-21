@@ -7,6 +7,13 @@ import {
   normalizeIncomingMessage,
   serializeMessageForWebhook,
 } from "./message-content.js";
+import {
+  DOWNLOADABLE_MEDIA_TYPES,
+  attachDownloadedMediaToPayload,
+  buildGatewayMediaTraceFields,
+  downloadInboundMedia,
+  gatewayMediaTrace,
+} from "./media-download.js";
 import { resolveProfilePictureUrl, resolveProfilePictureUrlCandidates } from "./profile-photo.js";
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
@@ -551,6 +558,102 @@ function bufferToBase64(value) {
   return null;
 }
 
+/**
+ * Structured pipeline stages for Laravel Super Admin diagnostics.
+ * @param {object} msg
+ * @param {object} payload
+ * @param {Awaited<ReturnType<typeof downloadInboundMedia>>|null} download
+ * @param {{ normalized_at?: string, download_started_at?: string }} timings
+ */
+function buildGatewayPipelineStages(msg, payload, download, timings = {}) {
+  const at = new Date().toISOString();
+  const messageType = String(payload?.message_type || "");
+  const isMedia = DOWNLOADABLE_MEDIA_TYPES.has(messageType);
+  const stages = [];
+
+  stages.push({
+    key: "baileys_received",
+    ok: true,
+    at: timings.received_at || at,
+    detail: `messages.upsert message_id=${payload?.message_id || msg?.key?.id || "?"}`,
+    elapsed_ms: 0,
+  });
+
+  stages.push({
+    key: "message_normalized",
+    ok: Boolean(payload?.message_id && payload?.remote_jid),
+    at: timings.normalized_at || at,
+    detail: `type=${messageType || "unknown"}`,
+    elapsed_ms: timings.normalize_ms ?? null,
+  });
+
+  stages.push({
+    key: "media_detected",
+    ok: isMedia,
+    at,
+    detail: isMedia ? "yes" : "no",
+  });
+
+  stages.push({
+    key: "media_type",
+    ok: true,
+    at,
+    detail: messageType || "—",
+  });
+
+  if (isMedia) {
+    stages.push({
+      key: "media_download_started",
+      ok: true,
+      at: timings.download_started_at || at,
+      detail: "downloadMediaMessage invoked",
+      elapsed_ms: timings.download_start_ms ?? null,
+    });
+
+    const dlOk = download?.ok === true;
+    stages.push({
+      key: "media_download_completed",
+      ok: dlOk,
+      at,
+      detail: dlOk
+        ? "Download OK"
+        : String(download?.error || download?.status || "download_failed"),
+      elapsed_ms: download?.elapsed_ms ?? null,
+      retry_count: download?.attempts ?? null,
+      file: dlOk ? null : "media-download.js",
+      line: dlOk ? null : 138,
+      error: dlOk ? null : String(download?.error || "download_failed"),
+      exception: dlOk
+        ? null
+        : {
+            class: "MediaDownloadError",
+            message: String(download?.error || "download_failed"),
+            summary: String(download?.error || "download_failed"),
+            file: "media-download.js",
+            line: 138,
+          },
+    });
+
+    stages.push({
+      key: "buffer_size",
+      ok: dlOk && (download?.size_bytes ?? 0) > 0,
+      at,
+      detail: dlOk && download?.size_bytes ? `${download.size_bytes} bytes` : "—",
+      buffer_size: download?.size_bytes ?? null,
+    });
+
+    stages.push({
+      key: "mime_type",
+      ok: Boolean(download?.mime_type || payload?.media?.mime_type),
+      at,
+      detail: String(download?.mime_type || payload?.media?.mime_type || "—"),
+      mime_type: download?.mime_type || payload?.media?.mime_type || null,
+    });
+  }
+
+  return stages;
+}
+
 function toUnixSeconds(ts) {
   if (ts == null) return Math.floor(Date.now() / 1000);
   const n = typeof ts === "object" && ts.toNumber ? ts.toNumber() : Number(ts);
@@ -761,7 +864,6 @@ async function postToLaravel(payload, attempt = 1) {
   const tokenSource = webhookToken ? "WEBHOOK_TOKEN" : gatewayToken ? "GATEWAY_TOKEN" : "none";
 
   const headers = {
-    "Content-Type": "application/json; charset=utf-8",
     Accept: "application/json",
   };
   if (token) {
@@ -777,7 +879,7 @@ async function postToLaravel(payload, attempt = 1) {
   });
   inboundLog("POST URL", { url, method: "POST" });
   inboundLog("POST headers", {
-    content_type: headers["Content-Type"],
+    content_type: "auto",
     accept: headers.Accept,
     x_webhook_token: token ? "[set]" : "[missing]",
     x_gateway_token: token ? "[set]" : "[missing]",
@@ -785,14 +887,94 @@ async function postToLaravel(payload, attempt = 1) {
   });
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15_000);
+  const mediaBuffer = payload?._mediaBuffer && Buffer.isBuffer(payload._mediaBuffer)
+    ? payload._mediaBuffer
+    : null;
+  const hasMediaBinary = Boolean(mediaBuffer) || Boolean(payload?.media_base64);
+  const timeoutMs = hasMediaBinary ? 90_000 : 15_000;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const started = Date.now();
 
+  // TEMP runtime probe (inbound image multipart) — do not change behavior.
+  const isBuffer = Buffer.isBuffer(payload?._mediaBuffer);
+  const bufferLength =
+    payload?._mediaBuffer && typeof payload._mediaBuffer.length === "number"
+      ? payload._mediaBuffer.length
+      : null;
+  inboundLog("TEMP media POST probe — buffer", {
+    message_id: payload.message_id || null,
+    message_type: payload.message_type || null,
+    "Buffer.isBuffer(payload._mediaBuffer)": isBuffer,
+    "payload._mediaBuffer?.length": bufferLength,
+    branch_will_be: mediaBuffer ? "FormData" : "JSON",
+  });
+
   try {
+    /** @type {BodyInit} */
+    let body;
+    /** @type {"FormData"|"JSON"} */
+    let bodyBranch;
+    if (mediaBuffer) {
+      // Multipart: raw downloaded buffer — do not re-encode to base64.
+      const meta = { ...payload };
+      delete meta._mediaBuffer;
+      delete meta.media_base64;
+      const form = new FormData();
+      form.append("payload_json", JSON.stringify(meta));
+      const mime =
+        (payload.media && payload.media.mime_type) ||
+        "application/octet-stream";
+      const filename =
+        (payload.media && payload.media.filename) ||
+        `${payload.message_type || "media"}_${payload.message_id || "bin"}`;
+      const mediaBlob = new Blob([new Uint8Array(mediaBuffer)], { type: mime });
+      form.append(
+        "media_file",
+        mediaBlob,
+        String(filename),
+      );
+      body = form;
+      bodyBranch = "FormData";
+      // Let fetch set multipart boundary Content-Type.
+      inboundLog("TEMP media POST probe — FormData", {
+        message_id: payload.message_id || null,
+        branch: "FormData",
+        media_file_appended: true,
+        blob_size: mediaBlob.size,
+        filename: String(filename),
+        mime: String(mime),
+      });
+    } else {
+      headers["Content-Type"] = "application/json; charset=utf-8";
+      const meta = { ...payload };
+      delete meta._mediaBuffer;
+      body = JSON.stringify(meta);
+      bodyBranch = "JSON";
+      inboundLog("TEMP media POST probe — JSON", {
+        message_id: payload.message_id || null,
+        branch: "JSON",
+        media_file_appended: false,
+        reason: "_mediaBuffer missing or not a Buffer",
+      });
+    }
+
+    let outgoingContentType = headers["Content-Type"] || null;
+    try {
+      const probe = new Request(url, { method: "POST", headers, body });
+      outgoingContentType = probe.headers.get("content-type") || outgoingContentType;
+    } catch {
+      /* probe optional */
+    }
+    inboundLog("TEMP media POST probe — outgoing Content-Type", {
+      message_id: payload.message_id || null,
+      branch: bodyBranch,
+      "Content-Type": outgoingContentType,
+    });
+
     const res = await fetch(url, {
       method: "POST",
       headers,
-      body: JSON.stringify(payload),
+      body,
       signal: controller.signal,
     });
     const durationMs = Date.now() - started;
@@ -999,9 +1181,12 @@ export function attachInboundListeners(clinicId, sock) {
             });
           }
         }
+        const receivedAt = new Date().toISOString();
+        const normalizeStarted = Date.now();
         const payload = buildInboundPayload(clinicId, msg, type, {
           phone_jid_from_lid: phoneFromLid,
         });
+        const normalizeMs = Date.now() - normalizeStarted;
         if (!payload) {
           inboundLog("Early return — payload builder returned null", {
             clinic_id: clinicId,
@@ -1013,6 +1198,81 @@ export function attachInboundListeners(clinicId, sock) {
           });
           continue;
         }
+
+        // Download media bytes (image/video/audio/document/sticker) before POST.
+        let download = null;
+        const downloadStartedAt = new Date().toISOString();
+        const shouldDownload = DOWNLOADABLE_MEDIA_TYPES.has(String(payload.message_type || ""));
+
+        // TEMP probe — immediately before downloadInboundMedia() is called (or skipped)
+        gatewayMediaTrace(
+          "before_downloadInboundMedia",
+          buildGatewayMediaTraceFields({
+            message_type: payload.message_type,
+            should_download: shouldDownload,
+            download_called: false,
+            download: null,
+            payload,
+            message_id: payload.message_id,
+          }),
+        );
+
+        if (shouldDownload) {
+          inboundLog("Media download start", {
+            clinic_id: clinicId,
+            message_id: payload.message_id,
+            message_type: payload.message_type,
+          });
+          download = await downloadInboundMedia(sock, msg, payload.message_type);
+
+          // TEMP probe — immediately before attachDownloadedMediaToPayload
+          gatewayMediaTrace(
+            "before_attachDownloadedMediaToPayload",
+            buildGatewayMediaTraceFields({
+              message_type: payload.message_type,
+              should_download: true,
+              download_called: true,
+              download,
+              payload,
+              message_id: payload.message_id,
+            }),
+          );
+
+          attachDownloadedMediaToPayload(payload, download);
+
+          // TEMP probe — immediately after attachDownloadedMediaToPayload
+          gatewayMediaTrace(
+            "after_attachDownloadedMediaToPayload",
+            buildGatewayMediaTraceFields({
+              message_type: payload.message_type,
+              should_download: true,
+              download_called: true,
+              download,
+              payload,
+              message_id: payload.message_id,
+            }),
+          );
+
+          inboundLog("Media download result", {
+            clinic_id: clinicId,
+            message_id: payload.message_id,
+            message_type: payload.message_type,
+            status: download.status,
+            size_bytes: download.size_bytes || null,
+            error: download.error || null,
+            attempts: download.attempts ?? null,
+            elapsed_ms: download.elapsed_ms ?? null,
+            has_base64: Boolean(payload.media_base64),
+            has_media_buffer: Boolean(payload._mediaBuffer),
+          });
+        }
+
+        payload._pipeline_stages = buildGatewayPipelineStages(msg, payload, download, {
+          received_at: receivedAt,
+          normalized_at: new Date().toISOString(),
+          normalize_ms: normalizeMs,
+          download_started_at: downloadStartedAt,
+        });
 
         // Best-effort profile photo (cached); never block / fail inbound on privacy errors.
         try {
@@ -1071,7 +1331,25 @@ export function attachInboundListeners(clinicId, sock) {
               ? String(payload.caption).slice(0, 80)
               : null,
           has_arabic: /[\u0600-\u06FF]/.test(String(payload.text || payload.caption || "")),
+          media_status: payload.media_status || null,
+          media_download_status: payload.media_download_status || null,
+          has_media_base64: Boolean(payload.media_base64),
+          has_media_buffer: Boolean(payload._mediaBuffer),
+          media_buffer_bytes: payload._mediaBuffer?.length || null,
         });
+
+        // TEMP probe — immediately before postToLaravel
+        gatewayMediaTrace(
+          "before_postToLaravel",
+          buildGatewayMediaTraceFields({
+            message_type: payload.message_type,
+            should_download: shouldDownload,
+            download_called: shouldDownload,
+            download,
+            payload,
+            message_id: payload.message_id,
+          }),
+        );
 
         const postResult = await postToLaravel(payload);
         if (postResult?.ok) {

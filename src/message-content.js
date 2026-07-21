@@ -72,9 +72,17 @@ function isLeafContent(node) {
       node.extendedTextMessage ||
       node.imageMessage ||
       node.videoMessage ||
+      node.ptvMessage ||
       node.audioMessage ||
       node.documentMessage ||
       node.stickerMessage ||
+      node.locationMessage ||
+      node.liveLocationMessage ||
+      node.contactMessage ||
+      node.contactsArrayMessage ||
+      node.pollCreationMessage ||
+      node.pollCreationMessageV3 ||
+      node.pollUpdateMessage ||
       node.buttonsResponseMessage ||
       node.listResponseMessage ||
       node.templateButtonReplyMessage ||
@@ -83,6 +91,30 @@ function isLeafContent(node) {
       node.templateMessage ||
       node.reactionMessage,
   );
+}
+
+function bufferToHex(value) {
+  if (!value) return null;
+  try {
+    if (Buffer.isBuffer(value)) return value.toString("hex");
+    if (value instanceof Uint8Array) return Buffer.from(value).toString("hex");
+    if (typeof value === "string") return value;
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+function bufferToBase64(value) {
+  if (!value) return null;
+  try {
+    if (Buffer.isBuffer(value)) return value.toString("base64");
+    if (value instanceof Uint8Array) return Buffer.from(value).toString("base64");
+    if (typeof value === "string") return value;
+  } catch {
+    /* ignore */
+  }
+  return null;
 }
 
 function str(value) {
@@ -131,16 +163,37 @@ function firstText(...candidates) {
 
 function mediaMetaFromProto(m) {
   if (!m || typeof m !== "object") return null;
-  return {
+  const meta = {
     mime_type: m.mimetype || null,
     filename: m.fileName || m.title || null,
     size_bytes: m.fileLength != null ? Number(m.fileLength) : null,
-    sha256: null,
+    file_length: m.fileLength != null ? Number(m.fileLength) : null,
+    sha256: bufferToHex(m.fileSha256),
+    file_enc_sha256: bufferToHex(m.fileEncSha256),
     direct_path: m.directPath || null,
+    media_key: bufferToBase64(m.mediaKey),
     height: m.height != null ? Number(m.height) : null,
     width: m.width != null ? Number(m.width) : null,
     seconds: m.seconds != null ? Number(m.seconds) : null,
+    duration: m.seconds != null ? Number(m.seconds) : null,
+    jpeg_thumbnail: null,
+    waveform: null,
   };
+  // Keep thumbnails small for Laravel poster / sticker fallback (< 64KB).
+  const thumb = m.jpegThumbnail;
+  if (thumb) {
+    const b64 = bufferToBase64(thumb);
+    if (b64 && b64.length <= 90_000) {
+      meta.jpeg_thumbnail = b64;
+    }
+  }
+  if (Array.isArray(m.waveform) && m.waveform.length) {
+    meta.waveform = m.waveform.slice(0, 128);
+  } else if (m.waveform) {
+    const wf = bufferToBase64(m.waveform);
+    if (wf && wf.length <= 8_000) meta.waveform = wf;
+  }
+  return meta;
 }
 
 /**
@@ -408,11 +461,24 @@ export function normalizeIncomingMessage(message) {
   if (inner.locationMessage || inner.liveLocationMessage) {
     const loc = inner.locationMessage || inner.liveLocationMessage;
     const text = firstText(loc?.name, loc?.address, loc?.comment, loc?.caption);
+    const degreesLatitude =
+      loc?.degreesLatitude != null ? Number(loc.degreesLatitude) : null;
+    const degreesLongitude =
+      loc?.degreesLongitude != null ? Number(loc.degreesLongitude) : null;
     return {
       message_type: "location",
       text,
-      caption: null,
-      media: null,
+      caption: firstText(loc?.caption) || null,
+      media: {
+        mime_type: null,
+        filename: null,
+        latitude: Number.isFinite(degreesLatitude) ? degreesLatitude : null,
+        longitude: Number.isFinite(degreesLongitude) ? degreesLongitude : null,
+        name: loc?.name || null,
+        address: loc?.address || null,
+        is_live: Boolean(inner.liveLocationMessage),
+        jpeg_thumbnail: bufferToBase64(loc?.jpegThumbnail),
+      },
       quoted_message_id: quotedMessageId,
       display_text: text,
     };
@@ -423,13 +489,57 @@ export function normalizeIncomingMessage(message) {
       inner.contactMessage?.displayName,
       inner.contactsArrayMessage?.displayName,
     );
+    const vcard = firstText(
+      inner.contactMessage?.vcard,
+      Array.isArray(inner.contactsArrayMessage?.contacts)
+        ? inner.contactsArrayMessage.contacts[0]?.vcard
+        : null,
+    );
     return {
       message_type: inner.contactsArrayMessage ? "contacts" : "contact",
       text,
       caption: null,
-      media: null,
+      media: {
+        mime_type: "text/vcard",
+        filename: text ? `${String(text).replace(/[^\w.-]+/g, "_")}.vcf` : "contact.vcf",
+        display_name: text,
+        vcard: vcard || null,
+        contact_count: Array.isArray(inner.contactsArrayMessage?.contacts)
+          ? inner.contactsArrayMessage.contacts.length
+          : 1,
+      },
       quoted_message_id: quotedMessageId,
       display_text: text,
+    };
+  }
+
+  if (inner.pollCreationMessage || inner.pollCreationMessageV3) {
+    const poll = inner.pollCreationMessage || inner.pollCreationMessageV3;
+    const text = firstText(poll?.name);
+    return {
+      message_type: "poll",
+      text,
+      caption: null,
+      media: {
+        poll_name: poll?.name || null,
+        selectable_options_count: poll?.selectableOptionsCount ?? null,
+        options: Array.isArray(poll?.options)
+          ? poll.options.map((o) => o?.optionName || o?.name || null).filter(Boolean)
+          : [],
+      },
+      quoted_message_id: quotedMessageId,
+      display_text: text,
+    };
+  }
+
+  if (inner.pollUpdateMessage) {
+    return {
+      message_type: "poll_update",
+      text: null,
+      caption: null,
+      media: null,
+      quoted_message_id: quotedMessageId,
+      display_text: null,
     };
   }
 
@@ -538,6 +648,9 @@ export function normalizeIncomingMessage(message) {
       inner.liveLocationMessage ||
       inner.contactMessage ||
       inner.contactsArrayMessage ||
+      inner.pollCreationMessage ||
+      inner.pollCreationMessageV3 ||
+      inner.pollUpdateMessage ||
       inner.reactionMessage ||
       inner.buttonsResponseMessage ||
       inner.templateButtonReplyMessage ||
